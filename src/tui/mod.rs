@@ -8,6 +8,7 @@ pub mod log_layer;
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -112,7 +113,8 @@ pub async fn run_tui(
     state: Arc<RwLock<AppState>>,
     logs: LogBuffer,
     ws_addr: String,
-    http_addr: String,
+    ws_online: Arc<AtomicBool>,
+    ws_clients: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -121,7 +123,7 @@ pub async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, state, logs, ws_addr, http_addr).await;
+    let result = run_loop(&mut terminal, state, logs, ws_addr, ws_online, ws_clients).await;
 
     // Always restore the terminal, even on error
     disable_raw_mode()?;
@@ -140,20 +142,19 @@ async fn run_loop(
     state: Arc<RwLock<AppState>>,
     logs: LogBuffer,
     ws_addr: String,
-    http_addr: String,
+    ws_online: Arc<AtomicBool>,
+    ws_clients: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
 
     loop {
         ticker.tick().await;
 
-        // Snapshot shared state (brief async read lock)
         let snapshot = {
             let s = state.read().await;
             Snapshot::from_state(&s)
         };
 
-        // Grab the most-recent log lines (newest first)
         let log_lines: Vec<String> = {
             logs.lock()
                 .unwrap()
@@ -164,7 +165,10 @@ async fn run_loop(
                 .collect()
         };
 
-        terminal.draw(|f| draw(f, &snapshot, &log_lines, &ws_addr, &http_addr))?;
+        let online = ws_online.load(Ordering::Relaxed);
+        let clients = ws_clients.load(Ordering::Relaxed);
+
+        terminal.draw(|f| draw(f, &snapshot, &log_lines, &ws_addr, online, clients))?;
 
         // Drain any pending key events (poll with zero timeout = non-blocking)
         while event::poll(Duration::ZERO)? {
@@ -183,7 +187,14 @@ async fn run_loop(
 // Drawing
 // ---------------------------------------------------------------------------
 
-fn draw(f: &mut Frame, snap: &Snapshot, log_lines: &[String], ws_addr: &str, http_addr: &str) {
+fn draw(
+    f: &mut Frame,
+    snap: &Snapshot,
+    log_lines: &[String],
+    ws_addr: &str,
+    ws_online: bool,
+    ws_clients: usize,
+) {
     let area = f.area();
 
     let chunks = Layout::default()
@@ -196,7 +207,7 @@ fn draw(f: &mut Frame, snap: &Snapshot, log_lines: &[String], ws_addr: &str, htt
         ])
         .split(area);
 
-    draw_server_status(f, chunks[0], ws_addr, http_addr);
+    draw_server_status(f, chunks[0], ws_addr, ws_online, ws_clients);
     draw_health(f, chunks[1], snap);
     draw_prices(f, chunks[2], snap);
     draw_logs(f, chunks[3], log_lines);
@@ -204,14 +215,13 @@ fn draw(f: &mut Frame, snap: &Snapshot, log_lines: &[String], ws_addr: &str, htt
 
 // ── Top bar: server status ───────────────────────────────────────────────────
 
-fn draw_server_status(f: &mut Frame, area: Rect, ws_addr: &str, http_addr: &str) {
-    // Servers are not yet implemented — always shown as offline.
-    // Replace `false` with actual health state once WS/HTTP tasks report status.
-    let servers: &[(&str, &str, &str, bool)] = &[
-        ("WS", "ws://", ws_addr, false),
-        ("HTTP", "http://", http_addr, false),
-    ];
-
+fn draw_server_status(
+    f: &mut Frame,
+    area: Rect,
+    ws_addr: &str,
+    ws_online: bool,
+    ws_clients: usize,
+) {
     let block = Block::default()
         .title(" Server Status ")
         .borders(Borders::ALL)
@@ -220,36 +230,33 @@ fn draw_server_status(f: &mut Frame, area: Rect, ws_addr: &str, http_addr: &str)
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut spans: Vec<Span> = Vec::new();
+    let (dot_color, status_str) = if ws_online {
+        (Color::Green, "online".to_string())
+    } else {
+        (Color::Red, "offline".to_string())
+    };
 
-    for (label, scheme, addr, online) in servers {
-        let (dot_color, status_color, status_str) = if *online {
-            (Color::Green, Color::Green, "online ")
-        } else {
-            (Color::Red, Color::Red, "offline")
-        };
+    let client_str = if ws_online {
+        format!("  ({ws_clients} client{})", if ws_clients == 1 { "" } else { "s" })
+    } else {
+        String::new()
+    };
 
-        spans.push(Span::styled("● ", Style::default().fg(dot_color)));
-        spans.push(Span::styled(
-            format!("{label} "),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            format!("{scheme}{addr}  "),
+    let spans = vec![
+        Span::styled("● ", Style::default().fg(dot_color)),
+        Span::styled(
+            "WS ",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("ws://{ws_addr}  "),
             Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::styled(
-            format!("{status_str}     "),
-            Style::default().fg(status_color),
-        ));
-    }
+        ),
+        Span::styled(status_str, Style::default().fg(dot_color)),
+        Span::styled(client_str, Style::default().fg(Color::DarkGray)),
+    ];
 
-    f.render_widget(
-        Paragraph::new(Line::from(spans)),
-        inner,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 // ── Top: feed health ────────────────────────────────────────────────────────

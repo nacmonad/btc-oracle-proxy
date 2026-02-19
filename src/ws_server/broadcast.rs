@@ -1,26 +1,15 @@
-//! Broadcasting price updates to connected WebSocket clients
+//! Broadcast channel type aliases for WsEvent distribution.
 
-use crate::models::PriceUpdate;
-use crate::error::OracleResult;
+use crate::models::WsEvent;
 use tokio::sync::broadcast;
 
-pub struct PriceBroadcaster {
-    tx: broadcast::Sender<PriceUpdate>,
-}
+/// Capacity chosen to absorb bursts while keeping memory bounded.
+/// At ~500ms ticks + occasional signal events, 1024 is ~8 minutes of backlog.
+pub const CHANNEL_CAPACITY: usize = 1024;
 
-impl PriceBroadcaster {
-    pub fn new() -> Self {
-        let (tx, _) = broadcast::channel(100);
-        Self { tx }
-    }
+pub type EventSender = broadcast::Sender<WsEvent>;
+pub type EventReceiver = broadcast::Receiver<WsEvent>;
 
-    pub fn broadcast_price(&self, price: PriceUpdate) -> OracleResult<()> {
-        // Ignore if no subscribers
-        let _ = self.tx.send(price);
-        Ok(())
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<PriceUpdate> {
-        self.tx.subscribe()
-    }
+pub fn new_channel() -> (EventSender, EventReceiver) {
+    broadcast::channel(CHANNEL_CAPACITY)
 }

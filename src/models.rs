@@ -128,8 +128,6 @@ pub struct AppState {
     /// Used to detect `round_settled` (baseline price changed).
     pub prev_chainlink_price: Option<f64>,
 
-    /// Pending events to be drained by the WebSocket broadcast loop.
-    pub pending_events: Vec<WsEvent>,
 }
 
 impl AppState {
@@ -147,7 +145,6 @@ impl AppState {
             prev_bb_width_pct: None,
             prev_pre_trigger: false,
             prev_chainlink_price: None,
-            pending_events: Vec::new(),
         }
     }
 }

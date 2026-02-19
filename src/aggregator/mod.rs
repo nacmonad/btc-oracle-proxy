@@ -15,7 +15,7 @@ use crate::models::{
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time::Duration;
 use tracing::{info, warn};
 
@@ -27,7 +27,11 @@ use tracing::{info, warn};
 /// 3. Computes deviation % and `round_imminent`
 /// 4. Calculates technical indicators
 /// 5. Writes a fully enriched `PriceUpdate` to state
-pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> OracleResult<()> {
+pub async fn run_aggregator(
+    state: Arc<RwLock<AppState>>,
+    config: Config,
+    event_tx: broadcast::Sender<WsEvent>,
+) -> OracleResult<()> {
     info!("Starting price aggregator...");
 
     // ── Exchange price channel ──────────────────────────────────────────────
@@ -156,6 +160,16 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                 s.last_update = Some(now);
 
                 // ── Event detection (rising-edge signals) ───────────────────
+                // Collect events locally, then release the write lock before
+                // broadcasting so we don't hold state locked during channel sends.
+
+                let mut outbound: Vec<WsEvent> = Vec::new();
+
+                // Tick — always emitted
+                outbound.push(WsEvent::Tick {
+                    ts: now,
+                    data: s.current_price.clone().unwrap(),
+                });
 
                 // 1. round_settled — chainlink baseline changed since last tick
                 if let (Some(prev_cl), Some(curr_cl)) = (s.prev_chainlink_price, chainlink_price) {
@@ -165,7 +179,12 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                         let duration = s.round_imminent_since.map(|t| {
                             now.signed_duration_since(t).num_seconds().max(0) as u64
                         });
-                        let evt = WsEvent::RoundSettled {
+                        info!(
+                            "🔗 CHAINLINK SETTLED: ${prev_cl:.2} → ${curr_cl:.2}  \
+                             delta={delta_pct:+.3}%  window={}s",
+                            duration.unwrap_or(0)
+                        );
+                        outbound.push(WsEvent::RoundSettled {
                             ts: now,
                             data: RoundSettledEvent {
                                 prev_price: prev_cl,
@@ -174,13 +193,7 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                                 delta_pct,
                                 round_duration_secs: duration,
                             },
-                        };
-                        info!(
-                            "🔗 CHAINLINK SETTLED: ${prev_cl:.2} → ${curr_cl:.2}  \
-                             delta={delta_pct:+.3}%  window={}s",
-                            duration.unwrap_or(0)
-                        );
-                        s.pending_events.push(evt);
+                        });
                         s.round_imminent_since = None;
                     }
                 }
@@ -193,7 +206,11 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                     {
                         let direction = if dev > 0.0 { RoundDirection::Up } else { RoundDirection::Down };
                         let dir_str = if dev > 0.0 { "UP" } else { "DOWN" };
-                        let evt = WsEvent::RoundTriggered {
+                        info!(
+                            "⚡ ROUND TRIGGERED {dir_str}: market=${market_price:.2}  \
+                             chainlink=${cl:.2}  deviation={dev:+.3}%  age={age}s"
+                        );
+                        outbound.push(WsEvent::RoundTriggered {
                             ts: now,
                             data: RoundTriggeredEvent {
                                 direction,
@@ -203,12 +220,7 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                                 deviation_pct: dev,
                                 exchange_prices: exchange_prices.clone(),
                             },
-                        };
-                        info!(
-                            "⚡ ROUND TRIGGERED {dir_str}: market=${market_price:.2}  \
-                             chainlink=${cl:.2}  deviation={dev:+.3}%  age={age}s"
-                        );
-                        s.pending_events.push(evt);
+                        });
                         s.round_imminent_since = Some(now);
                     }
                 }
@@ -224,7 +236,11 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                     {
                         let direction = if dev > 0.0 { RoundDirection::Up } else { RoundDirection::Down };
                         let dir_str = if dev > 0.0 { "UP" } else { "DOWN" };
-                        let evt = WsEvent::DeviationApproach {
+                        info!(
+                            "〰 DEVIATION APPROACHING {dir_str}: {dev:+.3}%  \
+                             market=${market_price:.2}  chainlink=${cl:.2}"
+                        );
+                        outbound.push(WsEvent::DeviationApproach {
                             ts: now,
                             data: DeviationApproachEvent {
                                 direction,
@@ -233,12 +249,7 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                                 chainlink_price: cl,
                                 chainlink_age_secs: age,
                             },
-                        };
-                        info!(
-                            "〰 DEVIATION APPROACHING {dir_str}: {dev:+.3}%  \
-                             market=${market_price:.2}  chainlink=${cl:.2}"
-                        );
-                        s.pending_events.push(evt);
+                        });
                     }
                 }
                 s.prev_deviation_approaching = dev_approaching;
@@ -253,9 +264,7 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                     indicators.bb_upper,
                     indicators.bb_lower,
                 );
-                let was_outside = s.prev_bb_breakout_dir.is_some();
-                let now_outside = curr_bb_dir.is_some();
-                if now_outside && !was_outside {
+                if curr_bb_dir.is_some() && s.prev_bb_breakout_dir.is_none() {
                     if let (Some(dir), Some(upper), Some(lower), Some(width)) = (
                         curr_bb_dir.clone(),
                         indicators.bb_upper,
@@ -264,7 +273,13 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                     ) {
                         let expanding = s.prev_bb_width_pct.map(|pw| width > pw).unwrap_or(false);
                         let dir_str = if matches!(dir, RoundDirection::Up) { "UP" } else { "DOWN" };
-                        let evt = WsEvent::BbBreakout {
+                        info!(
+                            "📈 BB BREAKOUT {dir_str}: market=${market_price:.2}  \
+                             width={width:.3}%  expanding={expanding}  \
+                             deviation={:.3}%",
+                            deviation_pct.unwrap_or(0.0)
+                        );
+                        outbound.push(WsEvent::BbBreakout {
                             ts: now,
                             data: BbBreakoutEvent {
                                 direction: dir,
@@ -275,14 +290,7 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                                 bb_expanding: expanding,
                                 deviation_pct,
                             },
-                        };
-                        info!(
-                            "📈 BB BREAKOUT {dir_str}: market=${market_price:.2}  \
-                             width={width:.3}%  expanding={expanding}  \
-                             deviation={:.3}%",
-                            deviation_pct.unwrap_or(0.0)
-                        );
-                        s.pending_events.push(evt);
+                        });
                     }
                 }
                 s.prev_bb_breakout_dir = curr_bb_dir;
@@ -305,11 +313,15 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                         let dev = deviation_pct.unwrap_or(0.0);
                         let dir_str = if matches!(direction, RoundDirection::Up) { "UP" } else { "DOWN" };
                         let sig_str = signals.join(", ");
-                        let evt = WsEvent::PreTriggerAlert {
+                        info!(
+                            "🎯 PRE-TRIGGER ALERT {dir_str}: dev={dev:+.3}%  \
+                             market=${market_price:.2}  signals=[{sig_str}]"
+                        );
+                        outbound.push(WsEvent::PreTriggerAlert {
                             ts: now,
                             data: PreTriggerAlertEvent {
                                 direction,
-                                signals: signals.clone(),
+                                signals,
                                 deviation_pct: dev,
                                 market_price,
                                 chainlink_price: cl,
@@ -318,17 +330,24 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                                 rsi_14: indicators.rsi_14,
                                 momentum_10: indicators.momentum_10,
                             },
-                        };
-                        info!(
-                            "🎯 PRE-TRIGGER ALERT {dir_str}: dev={dev:+.3}%  \
-                             market=${market_price:.2}  signals=[{sig_str}]"
-                        );
-                        s.pending_events.push(evt);
+                        });
                     }
                 }
                 s.prev_pre_trigger = pre_trigger_active;
 
+                // Release write lock before broadcasting
+                drop(s);
+
+                for evt in outbound {
+                    // Ignore SendError (no subscribers yet is fine)
+                    let _ = event_tx.send(evt);
+                }
+
                 // ── Periodic status log (every ~30s) ───────────────────────
+                let history_len = {
+                    let s = state.read().await;
+                    s.price_history.len()
+                };
                 update_count += 1;
                 if update_count % 60 == 1 {
                     match (deviation_pct, chainlink_price) {
@@ -337,13 +356,13 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                              deviation={dev:+.3}%{}  sources={}  history={}pts",
                             if round_imminent { "  ⚡ROUND IMMINENT" } else { "" },
                             fresh.len(),
-                            s.price_history.len()
+                            history_len
                         ),
                         _ => info!(
                             "BTC/USD ${market_price:.2}  (awaiting Chainlink baseline)  \
                              sources={}  history={}pts",
                             fresh.len(),
-                            s.price_history.len()
+                            history_len
                         ),
                     }
                 }

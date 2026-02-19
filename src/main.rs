@@ -12,6 +12,7 @@ mod monitoring;
 mod tui;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use tokio::sync::RwLock;
 use tracing::{info, warn, error as log_error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -20,13 +21,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    // Build the log capture buffer before tracing is initialised so the layer
-    // can hold a reference to it from the start.
     let log_buffer = tui::new_log_buffer();
 
-    // Layered subscriber: TUI log-capture only.
-    // The fmt layer is intentionally omitted — the TUI owns the terminal and
-    // writes to stdout directly via ratatui/crossterm.
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new("oracle_proxy=info,tokio=warn"))
         .with(tui::log_layer::TuiLogLayer::new(log_buffer.clone(), 200))
@@ -37,53 +33,64 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::load()?;
     let state = Arc::new(RwLock::new(models::AppState::new()));
 
-    // ── Background tasks ────────────────────────────────────────────────────
+    // ── Broadcast channel — aggregator publishes, WS clients subscribe ───────
+    let (event_tx, _) = ws_server::broadcast::new_channel();
 
+    // ── Shared status counters for the TUI ───────────────────────────────────
+    let ws_online = Arc::new(AtomicBool::new(false));
+    let ws_clients = Arc::new(AtomicUsize::new(0));
+
+    // ── Aggregator ────────────────────────────────────────────────────────────
     let state_agg = state.clone();
     let cfg_agg = config.clone();
+    let tx_agg = event_tx.clone();
     let aggregator_task = tokio::spawn(async move {
-        if let Err(e) = aggregator::run_aggregator(state_agg, cfg_agg).await {
+        if let Err(e) = aggregator::run_aggregator(state_agg, cfg_agg, tx_agg).await {
             log_error!("Aggregator error: {}", e);
         }
     });
 
+    // ── WebSocket server ──────────────────────────────────────────────────────
     let ws_addr = config.ws_listen_addr.clone();
     let state_ws = state.clone();
+    let ws_online_srv = ws_online.clone();
+    let ws_clients_srv = ws_clients.clone();
     let ws_task = tokio::spawn(async move {
-        if let Err(e) = ws_server::run_server(state_ws, &ws_addr).await {
+        if let Err(e) = ws_server::run_server(
+            state_ws,
+            &ws_addr,
+            event_tx,
+            ws_online_srv,
+            ws_clients_srv,
+        )
+        .await
+        {
             log_error!("WebSocket server error: {}", e);
         }
     });
 
-    let http_addr = config.http_listen_addr.clone();
-    let state_http = state.clone();
-    let http_task = tokio::spawn(async move {
-        if let Err(e) = http_api::run_server(state_http, &http_addr).await {
-            log_error!("HTTP server error: {}", e);
-        }
-    });
-
-    // ── TUI ─────────────────────────────────────────────────────────────────
-
+    // ── TUI ───────────────────────────────────────────────────────────────────
     let state_tui = state.clone();
     let tui_ws_addr = config.ws_listen_addr.clone();
-    let tui_http_addr = config.http_listen_addr.clone();
     let tui_task = tokio::spawn(async move {
-        if let Err(e) = tui::run_tui(state_tui, log_buffer, tui_ws_addr, tui_http_addr).await {
+        if let Err(e) = tui::run_tui(
+            state_tui,
+            log_buffer,
+            tui_ws_addr,
+            ws_online,
+            ws_clients,
+        )
+        .await
+        {
             log_error!("TUI error: {e}");
         }
     });
 
-    info!(
-        ws = %config.ws_listen_addr,
-        http = %config.http_listen_addr,
-        "OracleProxy started"
-    );
+    info!(ws = %config.ws_listen_addr, "OracleProxy started");
 
     tokio::select! {
         _ = aggregator_task => warn!("Aggregator task ended"),
         _ = ws_task         => warn!("WebSocket task ended"),
-        _ = http_task       => warn!("HTTP API task ended"),
         _ = tui_task        => info!("TUI closed — shutting down"),
     }
 
