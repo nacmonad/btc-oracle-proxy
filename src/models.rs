@@ -109,10 +109,27 @@ pub struct AppState {
     /// Per-exchange connection status, updated on every received message.
     pub exchange_status: DashMap<String, ExchangeStatus>,
 
-    /// Last committed Chainlink on-chain price from Polymarket RTDS.
+    /// Last committed Chainlink on-chain price (polled from Polygon RPC).
     pub chainlink_baseline: Option<ChainlinkBaseline>,
 
     pub last_update: Option<DateTime<Utc>>,
+
+    /// Timestamp when `round_imminent` first became true for the current event.
+    /// Reset to None after a `RoundSettled` event fires.
+    pub round_imminent_since: Option<DateTime<Utc>>,
+
+    // ── Edge-detection state (previous-tick values) ──────────────────────────
+
+    pub prev_round_imminent: bool,
+    pub prev_deviation_approaching: bool,
+    pub prev_bb_breakout_dir: Option<RoundDirection>,
+    pub prev_bb_width_pct: Option<f64>,
+    pub prev_pre_trigger: bool,
+    /// Used to detect `round_settled` (baseline price changed).
+    pub prev_chainlink_price: Option<f64>,
+
+    /// Pending events to be drained by the WebSocket broadcast loop.
+    pub pending_events: Vec<WsEvent>,
 }
 
 impl AppState {
@@ -123,6 +140,14 @@ impl AppState {
             exchange_status: DashMap::new(),
             chainlink_baseline: None,
             last_update: None,
+            round_imminent_since: None,
+            prev_round_imminent: false,
+            prev_deviation_approaching: false,
+            prev_bb_breakout_dir: None,
+            prev_bb_width_pct: None,
+            prev_pre_trigger: false,
+            prev_chainlink_price: None,
+            pending_events: Vec::new(),
         }
     }
 }
@@ -150,25 +175,132 @@ pub struct HealthResponse {
     pub last_price: Option<f64>,
 }
 
-/// WebSocket message types (server ↔ client).
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum WsMessage {
-    #[serde(rename = "subscribe")]
-    Subscribe { channels: Vec<String> },
-
-    #[serde(rename = "unsubscribe")]
-    Unsubscribe { channels: Vec<String> },
-
-    #[serde(rename = "price_update")]
-    PriceUpdate { data: PriceUpdate },
-
-    #[serde(rename = "heartbeat")]
-    Heartbeat { timestamp: DateTime<Utc> },
-
-    #[serde(rename = "error")]
-    Error { message: String, code: u16 },
-
-    #[serde(rename = "subscribed")]
-    Subscribed { channel: String },
+/// Direction of a Chainlink round trigger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum RoundDirection {
+    Up,
+    Down,
 }
+
+/// Fired once when deviation first crosses ±0.10% (rising edge only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundTriggeredEvent {
+    pub direction: RoundDirection,
+    pub market_price: f64,
+    pub chainlink_price: f64,
+    pub chainlink_age_secs: u64,
+    pub deviation_pct: f64,
+    pub exchange_prices: HashMap<String, f64>,
+}
+
+/// Fired when the Chainlink poller detects a new committed on-chain price.
+/// Marks the end of the opportunity window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundSettledEvent {
+    pub prev_price: f64,
+    pub new_price: f64,
+    pub price_delta: f64,
+    pub delta_pct: f64,
+    /// Seconds from when `round_imminent` first fired to when baseline updated.
+    pub round_duration_secs: Option<u64>,
+}
+
+/// Fired (rising edge) when deviation first crosses the 0.07% approach zone.
+/// Early warning before the 0.10% round trigger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviationApproachEvent {
+    pub direction: RoundDirection,
+    pub deviation_pct: f64,
+    pub market_price: f64,
+    pub chainlink_price: f64,
+    pub chainlink_age_secs: u64,
+}
+
+/// Fired when price breaks outside its Bollinger Band while the bands are
+/// expanding — indicates directional momentum building beyond recent range.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BbBreakoutEvent {
+    pub direction: RoundDirection,
+    pub market_price: f64,
+    pub bb_upper: f64,
+    pub bb_lower: f64,
+    /// `(bb_upper - bb_lower) / bb_middle × 100` — relative band width as % of price.
+    pub bb_width_pct: f64,
+    /// True when band width is wider than the previous tick (volatility expanding).
+    pub bb_expanding: bool,
+    pub deviation_pct: Option<f64>,
+}
+
+/// High-confidence pre-trigger convergence signal.
+/// Fires (rising edge) when ≥2 independent signals agree AND deviation ≥ 0.05%.
+/// Combination: BB breakout + deviation approach + aligned momentum (any two).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreTriggerAlertEvent {
+    pub direction: RoundDirection,
+    /// Which signals contributed: "bb_breakout", "deviation_approach",
+    /// "momentum_surge", "rsi_extreme"
+    pub signals: Vec<String>,
+    pub deviation_pct: f64,
+    pub market_price: f64,
+    pub chainlink_price: f64,
+    pub chainlink_age_secs: u64,
+    pub bb_width_pct: Option<f64>,
+    pub rsi_14: Option<f64>,
+    pub momentum_10: Option<f64>,
+}
+
+/// All server → client WebSocket events share this envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsEvent {
+    /// Regular tick (~500ms). Primary streaming update.
+    Tick {
+        ts: DateTime<Utc>,
+        data: PriceUpdate,
+    },
+    /// Rising-edge signal: deviation just crossed ±0.10%.
+    RoundTriggered {
+        ts: DateTime<Utc>,
+        data: RoundTriggeredEvent,
+    },
+    /// Chainlink baseline updated on-chain — opportunity window closed.
+    RoundSettled {
+        ts: DateTime<Utc>,
+        data: RoundSettledEvent,
+    },
+    /// Deviation entered the 0.07% approach zone (rising edge).
+    DeviationApproach {
+        ts: DateTime<Utc>,
+        data: DeviationApproachEvent,
+    },
+    /// Price broke outside Bollinger Band with bands expanding (rising edge).
+    BbBreakout {
+        ts: DateTime<Utc>,
+        data: BbBreakoutEvent,
+    },
+    /// Multiple signals converging — high-confidence pre-trigger alert (rising edge).
+    PreTriggerAlert {
+        ts: DateTime<Utc>,
+        data: PreTriggerAlertEvent,
+    },
+    /// Exchange feed connect/disconnect.
+    ExchangeStatus {
+        ts: DateTime<Utc>,
+        exchange: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+/// Inbound client → server messages.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsClientMessage {
+    Subscribe { channels: Vec<String> },
+    Unsubscribe { channels: Vec<String> },
+}
+
+/// Legacy alias kept for compatibility with existing handler stubs.
+pub type WsMessage = WsEvent;

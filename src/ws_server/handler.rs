@@ -1,21 +1,20 @@
 //! WebSocket message handler
 
-use crate::models::WsMessage;
+use crate::models::WsClientMessage;
 use crate::error::OracleResult;
 
-/// Handles incoming WebSocket messages from clients
-pub async fn handle_message(msg: WsMessage) -> OracleResult<()> {
+/// Handles inbound client → server messages.
+pub async fn handle_message(msg: WsClientMessage) -> OracleResult<()> {
     match msg {
-        WsMessage::Subscribe { channels } => {
-            // TODO: Subscribe client to channels
-            println!("Subscribe to: {:?}", channels);
+        WsClientMessage::Subscribe { channels } => {
+            // TODO: register client subscription
+            tracing::debug!("Subscribe request: {:?}", channels);
             Ok(())
         }
-        WsMessage::Unsubscribe { channels } => {
-            // TODO: Unsubscribe from channels
-            println!("Unsubscribe from: {:?}", channels);
+        WsClientMessage::Unsubscribe { channels } => {
+            // TODO: remove client subscription
+            tracing::debug!("Unsubscribe request: {:?}", channels);
             Ok(())
         }
-        _ => Ok(()),
     }
 }

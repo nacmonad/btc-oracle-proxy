@@ -423,6 +423,220 @@ async def oracle_consumer():
 - [ ] Monitoring dashboards (Grafana)
 - [ ] Runbooks for exchange outage / Chainlink delay scenarios
 
+> **Note:** Persistence, historical archival, and backtesting are intentionally out of scope for this service.
+> Those concerns live in a separate `polymarket-researcher` Python project that subscribes to this WS feed.
+
+---
+
+## OUTPUT SCHEMA
+
+### WebSocket Event Types (server → client)
+
+All messages share a common envelope:
+```json
+{ "type": "<event>", "ts": "<ISO-8601 UTC>", "data": { ... } }
+```
+
+#### `tick` — every aggregation interval (~500ms)
+The standard streaming update. Consumers should use this for real-time indicator feeds.
+```json
+{
+  "type": "tick",
+  "ts": "2026-02-19T15:06:03.669Z",
+  "data": {
+    "symbol": "BTC/USD",
+    "market_price": 66511.60,
+    "chainlink_price": 66598.68,
+    "chainlink_age_secs": 13,
+    "deviation_pct": -0.131,
+    "round_imminent": true,
+    "exchange_prices": {
+      "binance": 66508.00,
+      "coinbase": 66514.00,
+      "kraken": 66511.60
+    },
+    "indicators": {
+      "ema_12": 66490.00,
+      "ema_26": 66450.00,
+      "ema_50": 66320.00,
+      "rsi_14": 44.2,
+      "roc_10": -0.14,
+      "roc_20": -0.28,
+      "std_dev": 82.50,
+      "bb_upper": 66764.00,
+      "bb_middle": 66511.00,
+      "bb_lower": 66258.00,
+      "macd": 40.00,
+      "macd_signal": 35.00,
+      "macd_histogram": 5.00
+    }
+  }
+}
+```
+
+#### `round_triggered` — rising edge only, fires once per trigger event
+Emitted when `deviation_pct` first crosses ±0.10% (state transition: not-imminent → imminent).
+The most actionable event — this is the signal to consider a Polymarket position.
+```json
+{
+  "type": "round_triggered",
+  "ts": "2026-02-19T15:06:03.669Z",
+  "data": {
+    "direction": "DOWN",
+    "market_price": 66511.60,
+    "chainlink_price": 66598.68,
+    "chainlink_age_secs": 13,
+    "deviation_pct": -0.131,
+    "exchange_prices": {
+      "binance": 66508.00,
+      "coinbase": 66514.00,
+      "kraken": 66511.60
+    }
+  }
+}
+```
+
+#### `round_settled` — chainlink baseline updated on-chain
+Emitted when the Chainlink poller detects a new committed price (baseline changed).
+Marks the end of the opportunity window — Polymarket will settle against this new price.
+```json
+{
+  "type": "round_settled",
+  "ts": "2026-02-19T15:06:47.210Z",
+  "data": {
+    "prev_price": 66598.68,
+    "new_price": 66511.00,
+    "price_delta": -87.68,
+    "delta_pct": -0.132,
+    "round_duration_secs": 44
+  }
+}
+```
+
+#### `deviation_approach` — rising edge, deviation enters 0.07–0.10% zone
+Early warning before the round trigger. Fires once per approach event.
+Typical lead time over `round_triggered`: 5–20 seconds.
+```json
+{
+  "type": "deviation_approach",
+  "ts": "2026-02-19T15:05:58.000Z",
+  "data": {
+    "direction": "DOWN",
+    "deviation_pct": -0.073,
+    "market_price": 66549.00,
+    "chainlink_price": 66598.68,
+    "chainlink_age_secs": 8
+  }
+}
+```
+
+#### `bb_breakout` — price crosses outside Bollinger Band (rising edge)
+Fires when price exits its 2σ Bollinger Band. `bb_expanding: true` means volatility
+is growing (not a reversion spike) — higher conviction signal.
+Typical lead time over `round_triggered`: 10–30 seconds.
+```json
+{
+  "type": "bb_breakout",
+  "ts": "2026-02-19T15:05:55.000Z",
+  "data": {
+    "direction": "DOWN",
+    "market_price": 66560.00,
+    "bb_upper": 66680.00,
+    "bb_lower": 66570.00,
+    "bb_width_pct": 0.165,
+    "bb_expanding": true,
+    "deviation_pct": -0.058
+  }
+}
+```
+
+#### `pre_trigger_alert` — multi-signal convergence (rising edge, highest conviction)
+Fires when ≥2 independent signals align AND deviation ≥ 0.05%.
+This is the primary actionable signal for Polymarket position entry.
+
+**Signals checked:**
+| Signal | Condition |
+|---|---|
+| `bb_breakout` | Price outside 2σ band in deviation direction |
+| `deviation_approach` | `abs(dev) >= 0.07%` |
+| `momentum_surge` | ROC-10 > 0.02% aligned with deviation direction |
+| `rsi_extreme` | RSI > 65 (up) or < 35 (down) aligned with direction |
+
+```json
+{
+  "type": "pre_trigger_alert",
+  "ts": "2026-02-19T15:05:55.500Z",
+  "data": {
+    "direction": "DOWN",
+    "signals": ["bb_breakout", "momentum_surge"],
+    "deviation_pct": -0.062,
+    "market_price": 66557.00,
+    "chainlink_price": 66598.68,
+    "chainlink_age_secs": 5,
+    "bb_width_pct": 0.165,
+    "rsi_14": 38.2,
+    "momentum_10": -0.042
+  }
+}
+```
+
+#### `exchange_status` — feed connect/disconnect
+```json
+{
+  "type": "exchange_status",
+  "ts": "2026-02-19T15:06:00.000Z",
+  "data": {
+    "exchange": "binance",
+    "status": "connected",
+    "error": null
+  }
+}
+```
+
+### Event Timing Summary
+
+```
+t=0s   bb_breakout fires (price exits bands, bands expanding)
+t=5s   pre_trigger_alert fires (bb_breakout + momentum_surge ≥ 2 signals)
+t=8s   deviation_approach fires (deviation crosses 0.07%)
+t=15s  round_triggered fires (deviation crosses 0.10%)  ← Chainlink OCR2 begins
+t=44s  round_settled fires (new price committed on-chain)  ← Polymarket settles
+```
+Strategy window: between `pre_trigger_alert`/`round_triggered` and `round_settled`.
+
+---
+
+### HTTP Endpoints
+
+#### `GET /health`
+```json
+{
+  "status": "healthy",
+  "uptime_secs": 3600,
+  "exchanges": {
+    "binance":  { "status": "connected", "last_price": 66508.00, "age_ms": 320 },
+    "coinbase": { "status": "connected", "last_price": 66514.00, "age_ms": 410 },
+    "kraken":   { "status": "connected", "last_price": 66511.60, "age_ms": 290 }
+  },
+  "chainlink_age_secs": 13,
+  "price_freshness_ms": 80,
+  "ws_clients": 3
+}
+```
+
+#### `GET /api/v1/snapshot`
+Returns the full current `tick` payload — equivalent to the last WS `tick` event.
+
+#### `GET /metrics`
+Prometheus text format. Key metrics:
+- `oracle_market_price_usd`
+- `oracle_chainlink_price_usd`
+- `oracle_deviation_pct`
+- `oracle_chainlink_age_secs`
+- `oracle_round_trigger_total` (counter)
+- `oracle_exchange_connected{exchange}` (gauge 0/1)
+- `oracle_ws_clients`
+
 ---
 
 ## TESTING STRATEGY
@@ -526,8 +740,6 @@ Median aggregation over 3+ sources already handles this. If Binance has a moment
 - The staleness of this value is the core of our edge: it updates only on 0.1% deviation or heartbeat
 
 ### Future Enhancements
-- [ ] Historical deviation analysis (how often does the signal fire, how far does price move post-trigger)
 - [ ] Multi-asset feeds (ETH, SOL, etc)
-- [ ] On-chain settlement trigger monitoring
-- [ ] Historical data archival (SQLite/PostgreSQL)
+- [ ] On-chain settlement trigger monitoring (watch for tx confirming new round)
 - [ ] gRPC API for lower-latency bots

@@ -7,9 +7,10 @@ A Rust service that tracks BTC spot prices from major exchanges, monitors the la
 ## Features
 
 ### Deviation Detection
-- **Chainlink Baseline Tracking**: Reads current committed Chainlink price via Polymarket RTDS
+- **Chainlink Baseline Tracking**: Polls committed Chainlink BTC/USD price from Polygon RPC every 5s
 - **Real-Time Deviation Calc**: Continuously measures `(market_price - chainlink_price) / chainlink_price`
-- **Round Imminent Flag**: Emits `round_imminent: true` when deviation crosses ±0.1%
+- **Round Imminent Flag**: Emits `round_imminent: true` + `round_triggered` event when deviation crosses ±0.1%
+- **Round Settled Detection**: Fires `round_settled` event when baseline updates on-chain — marks end of opportunity window
 - **Baseline Age Tracking**: Surfaces how stale the Chainlink price is (staleness = opportunity window)
 
 ### Price Aggregation
@@ -17,22 +18,38 @@ A Rust service that tracks BTC spot prices from major exchanges, monitors the la
 - **No Explicit Outlier Filtering Needed**: With a median, a single bad feed gets outvoted automatically
 - **Exchange Prices Included**: Raw per-exchange prices surfaced for bot inspection
 
-### Technical Indicators
+### Technical Indicators (streaming, no persistence required)
 - **EMA**: 12, 26, 50 period exponential moving averages
-- **RSI**: Relative Strength Index (14 period)
+- **RSI**: Relative Strength Index (14 period) — overbought/oversold coloring in TUI
 - **Momentum**: Rate of Change (ROC) at 10 and 20 periods
-- **Volatility**: Standard Deviation and Bollinger Bands
-- **MACD**: Moving Average Convergence Divergence with signal line
+- **Volatility**: Standard Deviation and Bollinger Bands (2σ, 20-period)
+- **MACD**: Moving Average Convergence Divergence with signal line and histogram
+
+### Pre-Trigger Signal Events
+Leading-indicator events that fire *before* the 0.1% Chainlink round trigger:
+
+| Event | Trigger | Typical Lead |
+|---|---|---|
+| `deviation_approach` | `abs(dev) >= 0.07%` (rising edge) | 5–20s |
+| `bb_breakout` | Price exits 2σ Bollinger Band while bands expanding | 10–30s |
+| `pre_trigger_alert` | ≥2 signals align: BB breakout + approach + momentum + RSI extreme | 5–25s |
+
+### TUI Dashboard
+- **Server status bar**: WS + HTTP server health (live once servers implemented)
+- **Feed health**: Per-exchange latency + Chainlink baseline age with color-coded freshness
+- **Price panel**: Market price, Chainlink baseline, deviation with `⚡ ROUND IMMINENT` badge
+- **Exchange prices**: Per-source prices side by side
+- **Indicators panel**: EMA, RSI, ROC, StdDev, BB, MACD with directional coloring
+- **Log footer**: Rolling event log with color-coded levels
 
 ### WebSocket API
-- **Push-Based**: Low-latency feed to Python bot
-- **JSON Format**: Easy to parse, includes deviation fields on every message
-- **Heartbeat**: Periodic connection health checks
+- **Push-Based**: Low-latency event feed to Python bot
+- **7 event types**: `tick`, `round_triggered`, `round_settled`, `deviation_approach`, `bb_breakout`, `pre_trigger_alert`, `exchange_status`
+- **Rising-edge semantics**: Alert events fire once per state transition, not every tick
 
 ### HTTP REST API
 - **Health Checks**: `/health` endpoint including Chainlink baseline age
-- **Price Queries**: `/api/v1/price/{symbol}`
-- **Indicator Data**: `/api/v1/indicators`
+- **Snapshot**: `/api/v1/snapshot` — latest full tick payload
 - **Metrics**: `/metrics` for Prometheus scraping
 
 ## Project Structure
@@ -106,82 +123,114 @@ export POLYMARKET_RTDS_URL="wss://data-api.polymarket.com/"
 
 Or via `.env` file in project root.
 
-## WebSocket Message Format
+## WebSocket API
 
 ### Subscribe
 ```json
-{"action": "subscribe", "channels": ["BTC/USD"]}
+{"type": "subscribe", "channels": ["BTC/USD"]}
 ```
 
-### Price Update Message
+### Event Timeline
+```
+t=0s   bb_breakout        — price exits Bollinger Band, bands expanding
+t=5s   pre_trigger_alert  — ≥2 signals converging (bb_breakout + momentum)
+t=8s   deviation_approach — deviation crosses 0.07%
+t=15s  round_triggered    — deviation crosses 0.10%  ← OCR2 begins
+t=44s  round_settled      — new price committed on-chain  ← Polymarket settles
+```
+
+### `pre_trigger_alert` — highest conviction pre-entry signal
 ```json
 {
-  "type": "price_update",
+  "type": "pre_trigger_alert",
+  "ts": "2026-02-19T15:05:55.500Z",
   "data": {
-    "timestamp": "2025-09-12T12:34:56.789Z",
-    "symbol": "BTC/USD",
-    "market_price": 97985.00,
-    "chainlink_price": 97850.00,
-    "chainlink_age_secs": 42,
-    "deviation_pct": 0.138,
-    "round_imminent": true,
-    "exchange_prices": {
-      "binance": 97980.00,
-      "coinbase": 97990.00,
-      "kraken": 97985.00
-    },
-    "indicators": {
-      "ema_12": 97900.00,
-      "ema_26": 97800.00,
-      "ema_50": 97600.00,
-      "rsi_14": 65.50,
-      "roc_10": 0.14,
-      "roc_20": 0.28,
-      "volatility": 450.25,
-      "bb_upper": 98400.00,
-      "bb_middle": 97900.00,
-      "bb_lower": 97400.00,
-      "macd": 100.00,
-      "macd_signal": 92.00,
-      "macd_histogram": 8.00
-    }
+    "direction": "DOWN",
+    "signals": ["bb_breakout", "momentum_surge"],
+    "deviation_pct": -0.062,
+    "market_price": 66557.00,
+    "chainlink_price": 66598.68,
+    "chainlink_age_secs": 5,
+    "bb_width_pct": 0.165,
+    "rsi_14": 38.2,
+    "momentum_10": -0.042
+  }
+}
+```
+
+### `round_triggered` — OCR2 round now in progress
+```json
+{
+  "type": "round_triggered",
+  "ts": "2026-02-19T15:06:03.669Z",
+  "data": {
+    "direction": "DOWN",
+    "market_price": 66511.60,
+    "chainlink_price": 66598.68,
+    "chainlink_age_secs": 13,
+    "deviation_pct": -0.131,
+    "exchange_prices": { "binance": 66508.00, "coinbase": 66514.00, "kraken": 66511.60 }
+  }
+}
+```
+
+### `round_settled` — opportunity window closed
+```json
+{
+  "type": "round_settled",
+  "ts": "2026-02-19T15:06:47.210Z",
+  "data": {
+    "prev_price": 66598.68,
+    "new_price": 66511.00,
+    "price_delta": -87.68,
+    "delta_pct": -0.132,
+    "round_duration_secs": 44
   }
 }
 ```
 
 ### Key Fields for Trading Logic
 
-| Field | Description |
-|---|---|
-| `chainlink_price` | Last committed Chainlink on-chain price |
-| `chainlink_age_secs` | How long since Chainlink last updated |
-| `deviation_pct` | % difference between market and Chainlink price |
-| `round_imminent` | `true` when `abs(deviation_pct) >= 0.10` |
+| Field | Event | Description |
+|---|---|---|
+| `direction` | alert/trigger events | `"UP"` or `"DOWN"` |
+| `signals` | `pre_trigger_alert` | Which signals converged |
+| `deviation_pct` | all | % drift from last committed Chainlink price |
+| `chainlink_age_secs` | all | How stale the Chainlink baseline is |
+| `bb_width_pct` | `bb_breakout`, `pre_trigger_alert` | Band width as % of price — wider = more energy |
+| `round_duration_secs` | `round_settled` | Window from trigger to settlement |
 
 ## Python Bot Integration
 
 ```python
-import asyncio
-import json
-import websockets
+import asyncio, json, websockets
 
 async def oracle_consumer():
     async with websockets.connect('ws://localhost:8080/ws') as ws:
-        await ws.send(json.dumps({"action": "subscribe", "channels": ["BTC/USD"]}))
-        
+        await ws.send(json.dumps({"type": "subscribe", "channels": ["BTC/USD"]}))
+
         async for message in ws:
-            data = json.loads(message)
-            
-            if data['type'] == 'price_update':
-                d = data['data']
-                
-                if d['round_imminent']:
-                    direction = "UP" if d['deviation_pct'] > 0 else "DOWN"
-                    print(f"CHAINLINK ROUND TRIGGERING {direction}: "
-                          f"market={d['market_price']:.2f}, "
-                          f"chainlink={d['chainlink_price']:.2f}, "
-                          f"deviation={d['deviation_pct']:.3f}%")
-                    # Your Polymarket position logic here
+            ev = json.loads(message)
+            t, d = ev['type'], ev.get('data', {})
+
+            if t == 'pre_trigger_alert':
+                print(f"🎯 PRE-TRIGGER {d['direction']}: "
+                      f"dev={d['deviation_pct']:+.3f}%  "
+                      f"signals={d['signals']}  "
+                      f"bb_width={d.get('bb_width_pct', 0):.3f}%")
+                # Consider entry here — ~5-25s before round_triggered
+
+            elif t == 'round_triggered':
+                print(f"⚡ ROUND TRIGGERED {d['direction']}: "
+                      f"market={d['market_price']:.2f}  "
+                      f"chainlink={d['chainlink_price']:.2f}  "
+                      f"dev={d['deviation_pct']:+.3f}%")
+                # Last chance entry / confirm existing position
+
+            elif t == 'round_settled':
+                print(f"🔗 SETTLED: {d['prev_price']:.2f} → {d['new_price']:.2f} "
+                      f"({d['delta_pct']:+.3f}%)  window={d['round_duration_secs']}s")
+                # Close / record outcome
 
 asyncio.run(oracle_consumer())
 ```

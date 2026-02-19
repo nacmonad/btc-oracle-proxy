@@ -27,7 +27,7 @@ use ratatui::{
 };
 use tokio::sync::RwLock;
 
-use crate::models::AppState;
+use crate::models::{AppState, IndicatorValues};
 
 pub type LogBuffer = Arc<Mutex<VecDeque<String>>>;
 
@@ -48,6 +48,7 @@ struct Snapshot {
     exchange_prices: HashMap<String, f64>,
     /// (name, connected, ms_since_last_update)
     exchange_statuses: Vec<(String, bool, Option<i64>)>,
+    indicators: IndicatorValues,
     history_len: usize,
     last_update: Option<DateTime<Utc>>,
 }
@@ -82,6 +83,12 @@ impl Snapshot {
             .collect();
         exchange_statuses.sort_by(|a, b| a.0.cmp(&b.0));
 
+        let indicators = state
+            .current_price
+            .as_ref()
+            .map(|u| u.indicators.clone())
+            .unwrap_or_default();
+
         Self {
             market_price,
             chainlink_price,
@@ -90,6 +97,7 @@ impl Snapshot {
             round_imminent,
             exchange_prices,
             exchange_statuses,
+            indicators,
             history_len: state.price_history.len(),
             last_update: state.last_update,
         }
@@ -336,11 +344,16 @@ fn draw_prices(f: &mut Frame, area: Rect, snap: &Snapshot) {
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([
+            Constraint::Percentage(40), // market price / chainlink / deviation
+            Constraint::Percentage(25), // exchange prices
+            Constraint::Percentage(35), // indicators
+        ])
         .split(inner);
 
     draw_main_stats(f, cols[0], snap);
     draw_exchange_prices(f, cols[1], snap);
+    draw_indicators(f, cols[2], snap);
 }
 
 fn draw_main_stats(f: &mut Frame, area: Rect, snap: &Snapshot) {
@@ -517,6 +530,91 @@ fn draw_exchange_prices(f: &mut Frame, area: Rect, snap: &Snapshot) {
         [Constraint::Percentage(38), Constraint::Percentage(62)],
     );
     f.render_widget(table, inner);
+}
+
+fn draw_indicators(f: &mut Frame, area: Rect, snap: &Snapshot) {
+    let block = Block::default()
+        .title(" Indicators ")
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let ind = &snap.indicators;
+    let waiting = Span::styled("  —", Style::default().fg(Color::DarkGray));
+
+    // Helper: format an optional f64 with given decimal places
+    let fmt_opt = |v: Option<f64>, decimals: usize| -> Span<'static> {
+        match v {
+            Some(n) => Span::styled(
+                format!("{n:>10.*}", decimals),
+                Style::default().fg(Color::White),
+            ),
+            None => waiting.clone(),
+        }
+    };
+
+    // RSI color: overbought >70 red, oversold <30 green, else white
+    let rsi_span = match ind.rsi_14 {
+        Some(r) => {
+            let color = if r >= 70.0 {
+                Color::Red
+            } else if r <= 30.0 {
+                Color::Green
+            } else {
+                Color::White
+            };
+            Span::styled(format!("{r:>10.1}"), Style::default().fg(color))
+        }
+        None => waiting.clone(),
+    };
+
+    // MACD histogram color: positive green, negative red
+    let hist_span = match ind.macd_histogram {
+        Some(h) => {
+            let color = if h > 0.0 { Color::Green } else { Color::Red };
+            Span::styled(format!("{h:>+10.2}"), Style::default().fg(color))
+        }
+        None => waiting.clone(),
+    };
+
+    // ROC color: positive green, negative red
+    let roc_span = |v: Option<f64>| -> Span<'static> {
+        match v {
+            Some(r) => {
+                let color = if r > 0.0 { Color::Green } else { Color::Red };
+                Span::styled(format!("{r:>+10.3}%"), Style::default().fg(color))
+            }
+            None => waiting.clone(),
+        }
+    };
+
+    let label = |s: &'static str| {
+        Span::styled(s, Style::default().fg(Color::DarkGray))
+    };
+
+    let rows: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![label("  EMA 12   "), fmt_opt(ind.ema_12.map(|v| v), 2)]),
+        Line::from(vec![label("  EMA 26   "), fmt_opt(ind.ema_26, 2)]),
+        Line::from(vec![label("  EMA 50   "), fmt_opt(ind.ema_50, 2)]),
+        Line::from(""),
+        Line::from(vec![label("  RSI 14   "), rsi_span]),
+        Line::from(vec![label("  ROC 10   "), roc_span(ind.momentum_10)]),
+        Line::from(vec![label("  ROC 20   "), roc_span(ind.momentum_20)]),
+        Line::from(""),
+        Line::from(vec![label("  StdDev   "), fmt_opt(ind.volatility, 2)]),
+        Line::from(vec![label("  BB Upper "), fmt_opt(ind.bb_upper, 2)]),
+        Line::from(vec![label("  BB Mid   "), fmt_opt(ind.bb_middle, 2)]),
+        Line::from(vec![label("  BB Lower "), fmt_opt(ind.bb_lower, 2)]),
+        Line::from(""),
+        Line::from(vec![label("  MACD     "), fmt_opt(ind.macd, 2)]),
+        Line::from(vec![label("  Signal   "), fmt_opt(ind.macd_signal, 2)]),
+        Line::from(vec![label("  Hist     "), hist_span]),
+    ];
+
+    f.render_widget(Paragraph::new(rows), inner);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

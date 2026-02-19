@@ -7,7 +7,11 @@ pub mod exchange_client;
 use crate::config::Config;
 use crate::error::OracleResult;
 use crate::indicators::{self, IndicatorConfig};
-use crate::models::{AppState, ExchangePrice, ExchangeStatus, PriceUpdate};
+use crate::models::{
+    AppState, BbBreakoutEvent, DeviationApproachEvent, ExchangePrice, ExchangeStatus,
+    PreTriggerAlertEvent, PriceUpdate, RoundDirection, RoundSettledEvent, RoundTriggeredEvent,
+    WsEvent,
+};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,13 +150,186 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                     chainlink_age_secs,
                     deviation_pct,
                     round_imminent,
-                    exchange_prices,
-                    indicators,
+                    exchange_prices: exchange_prices.clone(),
+                    indicators: indicators.clone(),
                 });
                 s.last_update = Some(now);
 
+                // ── Event detection (rising-edge signals) ───────────────────
+
+                // 1. round_settled — chainlink baseline changed since last tick
+                if let (Some(prev_cl), Some(curr_cl)) = (s.prev_chainlink_price, chainlink_price) {
+                    if (curr_cl - prev_cl).abs() > 0.001 {
+                        let delta = curr_cl - prev_cl;
+                        let delta_pct = (delta / prev_cl) * 100.0;
+                        let duration = s.round_imminent_since.map(|t| {
+                            now.signed_duration_since(t).num_seconds().max(0) as u64
+                        });
+                        let evt = WsEvent::RoundSettled {
+                            ts: now,
+                            data: RoundSettledEvent {
+                                prev_price: prev_cl,
+                                new_price: curr_cl,
+                                price_delta: delta,
+                                delta_pct,
+                                round_duration_secs: duration,
+                            },
+                        };
+                        info!(
+                            "🔗 CHAINLINK SETTLED: ${prev_cl:.2} → ${curr_cl:.2}  \
+                             delta={delta_pct:+.3}%  window={}s",
+                            duration.unwrap_or(0)
+                        );
+                        s.pending_events.push(evt);
+                        s.round_imminent_since = None;
+                    }
+                }
+                s.prev_chainlink_price = chainlink_price;
+
+                // 2. round_triggered — rising edge of round_imminent
+                if round_imminent && !s.prev_round_imminent {
+                    if let (Some(dev), Some(cl), Some(age)) =
+                        (deviation_pct, chainlink_price, chainlink_age_secs)
+                    {
+                        let direction = if dev > 0.0 { RoundDirection::Up } else { RoundDirection::Down };
+                        let dir_str = if dev > 0.0 { "UP" } else { "DOWN" };
+                        let evt = WsEvent::RoundTriggered {
+                            ts: now,
+                            data: RoundTriggeredEvent {
+                                direction,
+                                market_price,
+                                chainlink_price: cl,
+                                chainlink_age_secs: age,
+                                deviation_pct: dev,
+                                exchange_prices: exchange_prices.clone(),
+                            },
+                        };
+                        info!(
+                            "⚡ ROUND TRIGGERED {dir_str}: market=${market_price:.2}  \
+                             chainlink=${cl:.2}  deviation={dev:+.3}%  age={age}s"
+                        );
+                        s.pending_events.push(evt);
+                        s.round_imminent_since = Some(now);
+                    }
+                }
+                s.prev_round_imminent = round_imminent;
+
+                // 3. deviation_approach — rising edge into 0.07–0.10% zone
+                let dev_approaching = deviation_pct
+                    .map(calculator::is_deviation_approaching)
+                    .unwrap_or(false);
+                if dev_approaching && !s.prev_deviation_approaching {
+                    if let (Some(dev), Some(cl), Some(age)) =
+                        (deviation_pct, chainlink_price, chainlink_age_secs)
+                    {
+                        let direction = if dev > 0.0 { RoundDirection::Up } else { RoundDirection::Down };
+                        let dir_str = if dev > 0.0 { "UP" } else { "DOWN" };
+                        let evt = WsEvent::DeviationApproach {
+                            ts: now,
+                            data: DeviationApproachEvent {
+                                direction,
+                                deviation_pct: dev,
+                                market_price,
+                                chainlink_price: cl,
+                                chainlink_age_secs: age,
+                            },
+                        };
+                        info!(
+                            "〰 DEVIATION APPROACHING {dir_str}: {dev:+.3}%  \
+                             market=${market_price:.2}  chainlink=${cl:.2}"
+                        );
+                        s.pending_events.push(evt);
+                    }
+                }
+                s.prev_deviation_approaching = dev_approaching;
+
+                // 4. bb_breakout — rising edge of price exiting Bollinger Bands
+                let curr_bb_width = match (indicators.bb_upper, indicators.bb_lower, indicators.bb_middle) {
+                    (Some(u), Some(l), Some(m)) => Some(calculator::bb_width_pct(u, l, m)),
+                    _ => None,
+                };
+                let curr_bb_dir = calculator::bb_breakout_direction(
+                    market_price,
+                    indicators.bb_upper,
+                    indicators.bb_lower,
+                );
+                let was_outside = s.prev_bb_breakout_dir.is_some();
+                let now_outside = curr_bb_dir.is_some();
+                if now_outside && !was_outside {
+                    if let (Some(dir), Some(upper), Some(lower), Some(width)) = (
+                        curr_bb_dir.clone(),
+                        indicators.bb_upper,
+                        indicators.bb_lower,
+                        curr_bb_width,
+                    ) {
+                        let expanding = s.prev_bb_width_pct.map(|pw| width > pw).unwrap_or(false);
+                        let dir_str = if matches!(dir, RoundDirection::Up) { "UP" } else { "DOWN" };
+                        let evt = WsEvent::BbBreakout {
+                            ts: now,
+                            data: BbBreakoutEvent {
+                                direction: dir,
+                                market_price,
+                                bb_upper: upper,
+                                bb_lower: lower,
+                                bb_width_pct: width,
+                                bb_expanding: expanding,
+                                deviation_pct,
+                            },
+                        };
+                        info!(
+                            "📈 BB BREAKOUT {dir_str}: market=${market_price:.2}  \
+                             width={width:.3}%  expanding={expanding}  \
+                             deviation={:.3}%",
+                            deviation_pct.unwrap_or(0.0)
+                        );
+                        s.pending_events.push(evt);
+                    }
+                }
+                s.prev_bb_breakout_dir = curr_bb_dir;
+                s.prev_bb_width_pct = curr_bb_width;
+
+                // 5. pre_trigger_alert — multi-signal convergence (rising edge)
+                let pre_trigger_result = calculator::detect_pre_trigger_signals(
+                    market_price,
+                    deviation_pct,
+                    indicators.bb_upper,
+                    indicators.bb_lower,
+                    indicators.momentum_10,
+                    indicators.rsi_14,
+                );
+                let pre_trigger_active = pre_trigger_result.is_some();
+                if pre_trigger_active && !s.prev_pre_trigger {
+                    if let (Some((direction, signals)), Some(cl), Some(age)) =
+                        (pre_trigger_result, chainlink_price, chainlink_age_secs)
+                    {
+                        let dev = deviation_pct.unwrap_or(0.0);
+                        let dir_str = if matches!(direction, RoundDirection::Up) { "UP" } else { "DOWN" };
+                        let sig_str = signals.join(", ");
+                        let evt = WsEvent::PreTriggerAlert {
+                            ts: now,
+                            data: PreTriggerAlertEvent {
+                                direction,
+                                signals: signals.clone(),
+                                deviation_pct: dev,
+                                market_price,
+                                chainlink_price: cl,
+                                chainlink_age_secs: age,
+                                bb_width_pct: curr_bb_width,
+                                rsi_14: indicators.rsi_14,
+                                momentum_10: indicators.momentum_10,
+                            },
+                        };
+                        info!(
+                            "🎯 PRE-TRIGGER ALERT {dir_str}: dev={dev:+.3}%  \
+                             market=${market_price:.2}  signals=[{sig_str}]"
+                        );
+                        s.pending_events.push(evt);
+                    }
+                }
+                s.prev_pre_trigger = pre_trigger_active;
+
+                // ── Periodic status log (every ~30s) ───────────────────────
                 update_count += 1;
-                // Log roughly every 30 seconds (60 × 500 ms intervals)
                 if update_count % 60 == 1 {
                     match (deviation_pct, chainlink_price) {
                         (Some(dev), Some(cl)) => info!(
@@ -168,19 +345,6 @@ pub async fn run_aggregator(state: Arc<RwLock<AppState>>, config: Config) -> Ora
                             fresh.len(),
                             s.price_history.len()
                         ),
-                    }
-                }
-
-                // Always log when a round becomes imminent (regardless of log throttle)
-                if round_imminent {
-                    if let (Some(dev), Some(cl)) = (deviation_pct, chainlink_price) {
-                        let direction = if dev > 0.0 { "UP" } else { "DOWN" };
-                        info!(
-                            "⚡ CHAINLINK ROUND TRIGGERING {direction}: \
-                             market=${market_price:.2}  chainlink=${cl:.2}  \
-                             deviation={dev:+.3}%  age={}s",
-                            chainlink_age_secs.unwrap_or(0)
-                        );
                     }
                 }
             }
