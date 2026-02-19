@@ -66,8 +66,10 @@ async fn main() -> anyhow::Result<()> {
     // ── TUI ─────────────────────────────────────────────────────────────────
 
     let state_tui = state.clone();
+    let tui_ws_addr = config.ws_listen_addr.clone();
+    let tui_http_addr = config.http_listen_addr.clone();
     let tui_task = tokio::spawn(async move {
-        if let Err(e) = tui::run_tui(state_tui, log_buffer).await {
+        if let Err(e) = tui::run_tui(state_tui, log_buffer, tui_ws_addr, tui_http_addr).await {
             log_error!("TUI error: {e}");
         }
     });

@@ -1,4 +1,5 @@
-//! Terminal UI — three-panel layout:
+//! Terminal UI — four-panel layout:
+//!   bar    : server status (WS + HTTP)
 //!   top    : feed health + per-exchange latency
 //!   center : live price summary (market vs chainlink, deviation, per-exchange)
 //!   footer : rolling log tail
@@ -102,6 +103,8 @@ impl Snapshot {
 pub async fn run_tui(
     state: Arc<RwLock<AppState>>,
     logs: LogBuffer,
+    ws_addr: String,
+    http_addr: String,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -110,7 +113,7 @@ pub async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, state, logs).await;
+    let result = run_loop(&mut terminal, state, logs, ws_addr, http_addr).await;
 
     // Always restore the terminal, even on error
     disable_raw_mode()?;
@@ -128,6 +131,8 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: Arc<RwLock<AppState>>,
     logs: LogBuffer,
+    ws_addr: String,
+    http_addr: String,
 ) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
 
@@ -151,7 +156,7 @@ async fn run_loop(
                 .collect()
         };
 
-        terminal.draw(|f| draw(f, &snapshot, &log_lines))?;
+        terminal.draw(|f| draw(f, &snapshot, &log_lines, &ws_addr, &http_addr))?;
 
         // Drain any pending key events (poll with zero timeout = non-blocking)
         while event::poll(Duration::ZERO)? {
@@ -170,21 +175,73 @@ async fn run_loop(
 // Drawing
 // ---------------------------------------------------------------------------
 
-fn draw(f: &mut Frame, snap: &Snapshot, log_lines: &[String]) {
+fn draw(f: &mut Frame, snap: &Snapshot, log_lines: &[String], ws_addr: &str, http_addr: &str) {
     let area = f.area();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),  // server status bar
             Constraint::Length(3),  // feed health
             Constraint::Min(10),    // prices
             Constraint::Length(10), // logs footer
         ])
         .split(area);
 
-    draw_health(f, chunks[0], snap);
-    draw_prices(f, chunks[1], snap);
-    draw_logs(f, chunks[2], log_lines);
+    draw_server_status(f, chunks[0], ws_addr, http_addr);
+    draw_health(f, chunks[1], snap);
+    draw_prices(f, chunks[2], snap);
+    draw_logs(f, chunks[3], log_lines);
+}
+
+// ── Top bar: server status ───────────────────────────────────────────────────
+
+fn draw_server_status(f: &mut Frame, area: Rect, ws_addr: &str, http_addr: &str) {
+    // Servers are not yet implemented — always shown as offline.
+    // Replace `false` with actual health state once WS/HTTP tasks report status.
+    let servers: &[(&str, &str, &str, bool)] = &[
+        ("WS", "ws://", ws_addr, false),
+        ("HTTP", "http://", http_addr, false),
+    ];
+
+    let block = Block::default()
+        .title(" Server Status ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    for (label, scheme, addr, online) in servers {
+        let (dot_color, status_color, status_str) = if *online {
+            (Color::Green, Color::Green, "online ")
+        } else {
+            (Color::Red, Color::Red, "offline")
+        };
+
+        spans.push(Span::styled("● ", Style::default().fg(dot_color)));
+        spans.push(Span::styled(
+            format!("{label} "),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("{scheme}{addr}  "),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!("{status_str}     "),
+            Style::default().fg(status_color),
+        ));
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        inner,
+    );
 }
 
 // ── Top: feed health ────────────────────────────────────────────────────────
