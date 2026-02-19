@@ -1,0 +1,58 @@
+[package]
+name = "oracle-proxy"
+version = "0.1.0"
+edition = "2021"
+authors = ["Trading Bot Team"]
+description = "Production-ready Rust service for BTC price aggregation and oracle mimicry"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Data structures
+dashmap = "5.5"  # Concurrent hashmap for real-time price data
+num-traits = "0.2"
+
+# Math utilities
+rust_decimal = "1.33"
+rust_decimal_macros = "1.33"
+
+# Database (optional, for price history)
+# sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite"] }
+
+# Configuration
+config = "0.13"
+dotenv = "0.15"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockito = "1.2"
+
+[[bin]]
+name = "oracle-proxy"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
