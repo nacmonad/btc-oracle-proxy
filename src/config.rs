@@ -28,6 +28,16 @@ pub struct Config {
     // Performance tuning
     pub price_history_capacity: usize,
     pub aggregation_interval_ms: u64,
+
+    // CLOB ingestion (WS-first)
+    pub clob_enabled: bool,
+    pub clob_ws_url: String,
+    pub clob_poll_interval_ms: u64,
+    pub clob_initial_backoff_ms: u64,
+    pub clob_max_backoff_ms: u64,
+    pub clob_writer_flush_ms: u64,
+    pub clob_assets: Vec<String>,
+    pub clob_timeframes: Vec<String>,
 }
 
 impl Config {
@@ -59,6 +69,32 @@ impl Config {
             
             price_history_capacity: 1000,
             aggregation_interval_ms: 500,
+
+            clob_enabled: env::var("CLOB_ENABLED")
+                .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false),
+            clob_ws_url: env::var("CLOB_WS_URL")
+                .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string()),
+            clob_poll_interval_ms: env::var("CLOB_POLL_INTERVAL_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+            clob_initial_backoff_ms: env::var("CLOB_INITIAL_BACKOFF_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+            clob_max_backoff_ms: env::var("CLOB_MAX_BACKOFF_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(60_000),
+            clob_writer_flush_ms: env::var("CLOB_WRITER_FLUSH_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+            clob_assets: env::var("CLOB_ASSETS")
+                .unwrap_or_else(|_| "BTC".to_string())
+                .split(',')
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            clob_timeframes: env::var("CLOB_TIMEFRAMES")
+                .unwrap_or_else(|_| "5m,15m".to_string())
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
         })
     }
 }

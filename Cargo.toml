@@ -38,7 +38,8 @@ num-traits = "0.2"
 rust_decimal = "1.33"
 rust_decimal_macros = "1.33"
 
-# Database (optional, for price history)
+# Database (DuckDB writer for shared researcher.db)
+duckdb = { version = "1.2", features = ["bundled"] }
 # sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite"] }
 
 # Configuration

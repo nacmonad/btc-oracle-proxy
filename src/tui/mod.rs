@@ -10,7 +10,9 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use duckdb::Connection;
 
 use chrono::{DateTime, Utc};
 use crossterm::{
@@ -39,6 +41,21 @@ pub fn new_log_buffer() -> LogBuffer {
 // ---------------------------------------------------------------------------
 // Snapshot — cheap clone of the data the TUI needs, taken under a read lock
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Page {
+    Oracle,
+    Clob,
+}
+
+struct ClobSummary {
+    timeframe: String,
+    tokens: i64,
+    avg_spread: Option<f64>,
+    avg_imb5: Option<f64>,
+    avg_slip100: Option<f64>,
+    last_ts: Option<String>,
+}
 
 struct Snapshot {
     market_price: Option<f64>,
@@ -105,6 +122,63 @@ impl Snapshot {
     }
 }
 
+fn clob_db_path() -> String {
+    std::env::var("RESEARCHER_DB_PATH")
+        .or_else(|_| std::env::var("DB_PATH"))
+        .unwrap_or_else(|_| "../data/researcher.db".to_string())
+}
+
+fn fetch_clob_summary() -> Vec<ClobSummary> {
+    let mut out = Vec::new();
+    let db_path = clob_db_path();
+
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+
+    let sql = r#"
+        WITH latest AS (
+            SELECT
+                ps.*,
+                pm.timeframe,
+                ROW_NUMBER() OVER (PARTITION BY ps.token_id ORDER BY ps.ts DESC) AS rn
+            FROM pm_snapshots ps
+            JOIN pm_markets pm ON pm.condition_id = ps.condition_id
+            WHERE pm.asset = 'BTC'
+              AND pm.timeframe IN ('5m', '15m')
+        )
+        SELECT
+            timeframe,
+            COUNT(*) AS tokens,
+            AVG(spread) AS avg_spread,
+            AVG(depth_imbalance_5) AS avg_imb5,
+            AVG(slippage_100) AS avg_slip100,
+            CAST(MAX(ts) AS VARCHAR) AS last_ts
+        FROM latest
+        WHERE rn = 1
+        GROUP BY timeframe
+        ORDER BY timeframe
+    "#;
+
+    if let Ok(mut stmt) = conn.prepare(sql) {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(r)) = rows.next() {
+                out.push(ClobSummary {
+                    timeframe: r.get::<usize, String>(0).unwrap_or_else(|_| "?".to_string()),
+                    tokens: r.get::<usize, i64>(1).unwrap_or(0),
+                    avg_spread: r.get::<usize, Option<f64>>(2).unwrap_or(None),
+                    avg_imb5: r.get::<usize, Option<f64>>(3).unwrap_or(None),
+                    avg_slip100: r.get::<usize, Option<f64>>(4).unwrap_or(None),
+                    last_ts: r.get::<usize, Option<String>>(5).unwrap_or(None),
+                });
+            }
+        }
+    }
+
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -146,6 +220,9 @@ async fn run_loop(
     ws_clients: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    let mut page = Page::Oracle;
+    let mut clob_summary_cache: Vec<ClobSummary> = Vec::new();
+    let mut last_clob_refresh = Instant::now() - Duration::from_secs(10);
 
     loop {
         ticker.tick().await;
@@ -168,15 +245,41 @@ async fn run_loop(
         let online = ws_online.load(Ordering::Relaxed);
         let clients = ws_clients.load(Ordering::Relaxed);
 
-        terminal.draw(|f| draw(f, &snapshot, &log_lines, &ws_addr, online, clients))?;
+        if matches!(page, Page::Clob) && last_clob_refresh.elapsed() >= Duration::from_secs(1) {
+            clob_summary_cache = fetch_clob_summary();
+            last_clob_refresh = Instant::now();
+        }
+
+        terminal.draw(|f| {
+            draw(
+                f,
+                &snapshot,
+                &clob_summary_cache,
+                &log_lines,
+                &ws_addr,
+                online,
+                clients,
+                page,
+            )
+        })?;
 
         // Drain any pending key events (poll with zero timeout = non-blocking)
         while event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press
-                    && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                {
-                    return Ok(());
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Tab => {
+                        page = match page {
+                            Page::Oracle => Page::Clob,
+                            Page::Clob => Page::Oracle,
+                        }
+                    }
+                    KeyCode::Char('1') => page = Page::Oracle,
+                    KeyCode::Char('2') => page = Page::Clob,
+                    _ => {}
                 }
             }
         }
@@ -190,10 +293,12 @@ async fn run_loop(
 fn draw(
     f: &mut Frame,
     snap: &Snapshot,
+    clob_summary: &[ClobSummary],
     log_lines: &[String],
     ws_addr: &str,
     ws_online: bool,
     ws_clients: usize,
+    page: Page,
 ) {
     let area = f.area();
 
@@ -202,14 +307,17 @@ fn draw(
         .constraints([
             Constraint::Length(3),  // server status bar
             Constraint::Length(3),  // feed health
-            Constraint::Min(10),    // prices
+            Constraint::Min(10),    // main panel
             Constraint::Length(10), // logs footer
         ])
         .split(area);
 
-    draw_server_status(f, chunks[0], ws_addr, ws_online, ws_clients);
+    draw_server_status(f, chunks[0], ws_addr, ws_online, ws_clients, page);
     draw_health(f, chunks[1], snap);
-    draw_prices(f, chunks[2], snap);
+    match page {
+        Page::Oracle => draw_prices(f, chunks[2], snap),
+        Page::Clob => draw_clob_page(f, chunks[2], clob_summary),
+    }
     draw_logs(f, chunks[3], log_lines);
 }
 
@@ -221,6 +329,7 @@ fn draw_server_status(
     ws_addr: &str,
     ws_online: bool,
     ws_clients: usize,
+    page: Page,
 ) {
     let block = Block::default()
         .title(" Server Status ")
@@ -242,6 +351,11 @@ fn draw_server_status(
         String::new()
     };
 
+    let page_label = match page {
+        Page::Oracle => "Page 1: Oracle",
+        Page::Clob => "Page 2: CLOB/L2",
+    };
+
     let spans = vec![
         Span::styled("● ", Style::default().fg(dot_color)),
         Span::styled(
@@ -254,6 +368,9 @@ fn draw_server_status(
         ),
         Span::styled(status_str, Style::default().fg(dot_color)),
         Span::styled(client_str, Style::default().fg(Color::DarkGray)),
+        Span::styled("    ", Style::default().fg(Color::DarkGray)),
+        Span::styled(page_label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("   [1] Oracle  [2] CLOB  [Tab] switch  [q] quit", Style::default().fg(Color::DarkGray)),
     ];
 
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
@@ -361,6 +478,69 @@ fn draw_prices(f: &mut Frame, area: Rect, snap: &Snapshot) {
     draw_main_stats(f, cols[0], snap);
     draw_exchange_prices(f, cols[1], snap);
     draw_indicators(f, cols[2], snap);
+}
+
+fn draw_clob_page(f: &mut Frame, area: Rect, summary: &[ClobSummary]) {
+    let outer = Block::default()
+        .title(" CLOB / L2 (BTC 5m & 15m) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    if summary.is_empty() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled("  No BTC 5m/15m CLOB rows yet.", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled("  Check pm_markets discovery + CLOB writer task.", Style::default().fg(Color::DarkGray))),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    let header = Row::new(vec![
+        Cell::from("Timeframe"),
+        Cell::from("Tokens"),
+        Cell::from("Avg Spread"),
+        Cell::from("Avg Imb(5)"),
+        Cell::from("Avg Slip $100"),
+        Cell::from("Last TS"),
+    ])
+    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = summary
+        .iter()
+        .map(|s| {
+            Row::new(vec![
+                Cell::from(format!("{}", s.timeframe)),
+                Cell::from(format!("{}", s.tokens)),
+                Cell::from(format!("{}", s.avg_spread.map(|v| format!("{v:.4}" )).unwrap_or_else(|| "-".into()))),
+                Cell::from(format!("{}", s.avg_imb5.map(|v| format!("{v:+.4}" )).unwrap_or_else(|| "-".into()))),
+                Cell::from(format!("{}", s.avg_slip100.map(|v| format!("{v:.4}" )).unwrap_or_else(|| "-".into()))),
+                Cell::from(s.last_ts.clone().unwrap_or_else(|| "-".into())),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(14),
+            Constraint::Min(20),
+        ],
+    )
+    .header(header)
+    .column_spacing(2)
+    .block(Block::default().borders(Borders::NONE));
+
+    f.render_widget(table, inner);
 }
 
 fn draw_main_stats(f: &mut Frame, area: Rect, snap: &Snapshot) {

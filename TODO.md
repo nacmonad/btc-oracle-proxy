@@ -718,6 +718,73 @@ GET /health
 
 ---
 
+## PHASE 6 — MOVE CLOB COLLECTOR INTO RUST (rs-clob-client)
+
+**Objective:** Consolidate live market-data ingestion (oracle + Polymarket CLOB) into `btc-oracle-proxy` for lower-latency execution and cleaner separation (Rust = live path, Python = research/backtesting).
+
+### Scope Decision
+- Keep `polymarket-researcher` as **DuckDB schema + analytics/backtest** layer.
+- Move live CLOB collection responsibilities from Python `pm_clob_consumer.py` into Rust.
+- Python should no longer be required in the live execution loop.
+
+### Dependency
+- [ ] Integrate `rs-clob-client`: https://github.com/Polymarket/rs-clob-client
+- [ ] Pin crate revision/tag and document compatibility in `Cargo.toml`.
+- [ ] Add integration tests to validate API responses and WS reconnection behavior.
+
+### Rust Modules (new)
+- [ ] `src/clob/mod.rs`
+- [ ] `src/clob/client.rs` — wraps rs-clob-client REST/WS usage
+- [ ] `src/clob/book_cache.rs` — in-memory order book state per token
+- [ ] `src/clob/metrics.rs` — L1 + L2 derived metrics
+- [ ] `src/clob/writer.rs` — async DB write queue to DuckDB (batch insert)
+
+### Data Flow (Rust hot path)
+1. Subscribe to active token IDs for target markets.
+2. Maintain in-memory book state per token (full book or top-N levels).
+3. Compute:
+   - L1: `best_bid`, `best_ask`, `mid`, `spread`, `bid_depth_1`, `ask_depth_1`
+   - L2 derived: `bid_depth_5/10`, `ask_depth_5/10`, `depth_imbalance_5/10`, `slippage_100/1000`, level counts.
+4. Batch-write snapshots to `researcher.db` on an interval (non-blocking writer task).
+
+### DuckDB Integration
+- [ ] Use one dedicated writer task/thread for DB IO (bounded mpsc queue).
+- [ ] Never block WS ingestion on DB writes.
+- [ ] Batch inserts every 250-500ms (configurable) or every N updates.
+- [ ] Add drop/backpressure policy when queue is full (log + metric).
+- [ ] Use shared DB path: `../data/researcher.db` (repo root `Polymarket/data/`).
+
+### Schema Tasks (researcher DB)
+- [ ] Extend `pm_snapshots` with L2-derived aggregate columns.
+- [ ] Optional: add `pm_order_book_levels` for periodic full depth archival.
+- [ ] Add `source` field (`live_rust`, `backfill_cli`, `legacy_python`) for lineage.
+- [ ] Add indexes for `(token_id, ts)` and `(condition_id, ts)` if missing.
+
+### Backfill Strategy (important)
+- Historical CLI endpoint provides **1-minute price series**, not full historical L2 book depth.
+- [ ] Keep periodic backfill for price gaps via CLI `price-history`.
+- [ ] Treat historical L2 as **forward-only** unless a true historical book source is introduced.
+- [ ] Optional: run periodic Rust snapshots (e.g., every 5m) into `pm_order_book_levels` for richer future datasets.
+
+### Performance Guardrails
+- [ ] p95 ingest loop latency target: < 20ms (excluding network jitter).
+- [ ] DB write queue depth alert threshold.
+- [ ] WS reconnect backoff with jitter.
+- [ ] Metrics: messages/sec, dropped updates, queue lag, snapshot writes/sec, 429/error counts.
+
+### Migration Plan
+- [ ] Phase A: Run Rust collector in shadow mode; keep Python collector as reference.
+- [ ] Phase B: Compare row counts/quality (L1 parity + L2 metric sanity checks).
+- [ ] Phase C: Switch primary writes to Rust; disable Python collector in live stack.
+- [ ] Phase D: Keep Python paths for offline backtesting + model experiments only.
+
+### Deliverables
+- [ ] Rust CLOB collector running in production with DB writes.
+- [ ] Updated docs describing decoupled architecture.
+- [ ] Validation report: Rust vs Python collector parity window (24-72h).
+
+---
+
 ## NOTES & REFERENCES
 
 ### Chainlink Aggregation Methodology

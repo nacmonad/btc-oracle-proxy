@@ -10,6 +10,7 @@ mod ws_server;
 mod http_api;
 mod monitoring;
 mod tui;
+mod clob;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -39,6 +40,25 @@ async fn main() -> anyhow::Result<()> {
     // ── Shared status counters for the TUI ───────────────────────────────────
     let ws_online = Arc::new(AtomicBool::new(false));
     let ws_clients = Arc::new(AtomicUsize::new(0));
+
+    // ── Optional CLOB writer + WS-first ingest ───────────────────────────────
+    let mut clob_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if config.clob_enabled {
+        let (writer, rx) = clob::ClobWriter::new(20_000);
+        let flush_ms = config.clob_writer_flush_ms;
+        clob_tasks.push(tokio::spawn(async move {
+            clob::writer::run_writer_loop(rx, flush_ms).await;
+        }));
+
+        let cfg_clob = config.clone();
+        clob_tasks.push(tokio::spawn(async move {
+            if let Err(e) = clob::ws::run_ws_first(writer, cfg_clob).await {
+                log_error!("CLOB WS-first loop error: {}", e);
+            }
+        }));
+
+        info!("CLOB WS-first ingestion enabled");
+    }
 
     // ── Aggregator ────────────────────────────────────────────────────────────
     let state_agg = state.clone();
