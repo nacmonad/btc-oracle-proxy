@@ -227,7 +227,7 @@ fn ts_sql(ts: &DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>, write_levels: bool) -> anyhow::Result<()> {
+fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>, write_levels: bool, max_levels: usize) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -304,7 +304,7 @@ fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>, write_levels:
             if let Some(lvl_stmt) = lvl_stmt.as_mut() {
                 // Full depth archival (BID side)
                 let mut cumulative = 0.0f64;
-                for (idx, lvl) in r.bid_levels.iter().enumerate() {
+                for (idx, lvl) in r.bid_levels.iter().take(max_levels).enumerate() {
                     cumulative += lvl.size;
                     lvl_stmt.execute(params![
                         ts_sql(&r.ts),
@@ -321,7 +321,7 @@ fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>, write_levels:
 
                 // Full depth archival (ASK side)
                 cumulative = 0.0;
-                for (idx, lvl) in r.ask_levels.iter().enumerate() {
+                for (idx, lvl) in r.ask_levels.iter().take(max_levels).enumerate() {
                     cumulative += lvl.size;
                     lvl_stmt.execute(params![
                         ts_sql(&r.ts),
@@ -433,6 +433,11 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<DbOp>, flush_every_ms: u64, 
     let write_ticks = std::env::var("ORACLE_WRITE_TICKS")
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
+    let max_levels = std::env::var("CLOB_MAX_LEVELS")
+        .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(10);
+    let tick_every_n = std::env::var("ORACLE_TICK_DB_EVERY_N")
+        .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5).max(1);
+    info!(write_levels, write_ticks, max_levels, tick_every_n, "db writer throughput controls");
 
     let mut buf_snap: Vec<SnapshotRow> = Vec::with_capacity(2048);
     let mut buf_oracle: Vec<WsEvent> = Vec::with_capacity(2048);
@@ -443,6 +448,7 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<DbOp>, flush_every_ms: u64, 
     let mut received_rows: u64 = 0;
     let mut flush_error_count: u64 = 0;
     let mut recovered_drop_count: u64 = 0;
+    let mut tick_seen: u64 = 0;
 
     loop {
         tokio::select! {
@@ -452,12 +458,23 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<DbOp>, flush_every_ms: u64, 
                         received_rows += 1;
                         match op {
                             DbOp::Snapshot(row) => buf_snap.push(row),
-                            DbOp::OracleEvent(evt) => buf_oracle.push(evt),
+                            DbOp::OracleEvent(evt) => {
+                                let keep = match &evt {
+                                    WsEvent::Tick { .. } => {
+                                        tick_seen += 1;
+                                        (tick_seen % tick_every_n) == 0
+                                    }
+                                    _ => true,
+                                };
+                                if keep {
+                                    buf_oracle.push(evt);
+                                }
+                            },
                             DbOp::MarketUpserts(rows) => if !rows.is_empty() { buf_markets.push(rows); },
                         }
 
                         if buf_snap.len() >= 1000 || buf_oracle.len() >= 1000 || buf_markets.len() >= 8 {
-                            if let Err(e) = flush_batch(&mut conn, &mut buf_snap, write_levels)
+                            if let Err(e) = flush_batch(&mut conn, &mut buf_snap, write_levels, max_levels)
                                 .and_then(|_| flush_oracle_events(&mut conn, &mut buf_oracle, write_ticks))
                                 .and_then(|_| flush_market_upserts(&mut conn, &mut buf_markets))
                             {
@@ -474,7 +491,7 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<DbOp>, flush_every_ms: u64, 
                         }
                     }
                     None => {
-                        if let Err(e) = flush_batch(&mut conn, &mut buf_snap, write_levels)
+                        if let Err(e) = flush_batch(&mut conn, &mut buf_snap, write_levels, max_levels)
                             .and_then(|_| flush_oracle_events(&mut conn, &mut buf_oracle, write_ticks))
                             .and_then(|_| flush_market_upserts(&mut conn, &mut buf_markets))
                         {
@@ -485,7 +502,7 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<DbOp>, flush_every_ms: u64, 
                 }
             }
             _ = ticker.tick() => {
-                if let Err(e) = flush_batch(&mut conn, &mut buf_snap, write_levels)
+                if let Err(e) = flush_batch(&mut conn, &mut buf_snap, write_levels, max_levels)
                     .and_then(|_| flush_oracle_events(&mut conn, &mut buf_oracle, write_ticks))
                     .and_then(|_| flush_market_upserts(&mut conn, &mut buf_markets))
                 {
