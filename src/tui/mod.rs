@@ -10,9 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use duckdb::Connection;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use crossterm::{
@@ -30,6 +28,7 @@ use ratatui::{
 };
 use tokio::sync::RwLock;
 
+use crate::clob::ClobUiState;
 use crate::models::{AppState, IndicatorValues};
 
 pub type LogBuffer = Arc<Mutex<VecDeque<String>>>;
@@ -48,13 +47,27 @@ enum Page {
     Clob,
 }
 
-struct ClobSummary {
+#[derive(Clone, Default)]
+struct ClobSideView {
+    token_id: String,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+    spread: Option<f64>,
+    bid_depth5: Option<f64>,
+    ask_depth5: Option<f64>,
+    imbalance5: Option<f64>,
+    slip100: Option<f64>,
+    updated_at: String,
+}
+
+#[derive(Clone, Default)]
+struct ClobMarketRow {
+    close_time: String,
+    asset: String,
     timeframe: String,
-    tokens: i64,
-    avg_spread: Option<f64>,
-    avg_imb5: Option<f64>,
-    avg_slip100: Option<f64>,
-    last_ts: Option<String>,
+    condition_id: String,
+    up: Option<ClobSideView>,
+    down: Option<ClobSideView>,
 }
 
 struct Snapshot {
@@ -122,61 +135,78 @@ impl Snapshot {
     }
 }
 
-fn clob_db_path() -> String {
-    std::env::var("RESEARCHER_DB_PATH")
-        .or_else(|_| std::env::var("DB_PATH"))
-        .unwrap_or_else(|_| "../data/researcher.db".to_string())
+fn format_close_time_compact(s: &str) -> String {
+    // Example input: 2026-02-28 01:15:00+00  -> 2026-02-28 01:15
+    if s.len() >= 16 {
+        s[..16].to_string()
+    } else {
+        s.to_string()
+    }
 }
 
-fn fetch_clob_summary() -> Vec<ClobSummary> {
-    let mut out = Vec::new();
-    let db_path = clob_db_path();
+fn timeframe_rank_minutes(tf: &str) -> i64 {
+    let t = tf.trim().to_lowercase();
+    if let Some(n) = t.strip_suffix('m').and_then(|x| x.parse::<i64>().ok()) {
+        return n;
+    }
+    if let Some(n) = t.strip_suffix('h').and_then(|x| x.parse::<i64>().ok()) {
+        return n * 60;
+    }
+    if let Some(n) = t.strip_suffix('d').and_then(|x| x.parse::<i64>().ok()) {
+        return n * 24 * 60;
+    }
+    i64::MAX / 2
+}
 
-    let conn = match Connection::open(db_path) {
-        Ok(c) => c,
-        Err(_) => return out,
-    };
+fn build_clob_market_rows(state: &ClobUiState) -> Vec<ClobMarketRow> {
+    use std::collections::HashMap;
+    let mut by_market: HashMap<String, ClobMarketRow> = HashMap::new();
 
-    let sql = r#"
-        WITH latest AS (
-            SELECT
-                ps.*,
-                pm.timeframe,
-                ROW_NUMBER() OVER (PARTITION BY ps.token_id ORDER BY ps.ts DESC) AS rn
-            FROM pm_snapshots ps
-            JOIN pm_markets pm ON pm.condition_id = ps.condition_id
-            WHERE pm.asset = 'BTC'
-              AND pm.timeframe IN ('5m', '15m')
-        )
-        SELECT
-            timeframe,
-            COUNT(*) AS tokens,
-            AVG(spread) AS avg_spread,
-            AVG(depth_imbalance_5) AS avg_imb5,
-            AVG(slippage_100) AS avg_slip100,
-            CAST(MAX(ts) AS VARCHAR) AS last_ts
-        FROM latest
-        WHERE rn = 1
-        GROUP BY timeframe
-        ORDER BY timeframe
-    "#;
+    for (token_id, tok) in state.tokens.iter() {
+        let meta = state.markets.get(token_id);
+        let timeframe = meta.map(|m| m.timeframe.clone()).unwrap_or_else(|| tok.timeframe.clone());
+        if timeframe != "5m" && timeframe != "15m" { continue; }
+        let close_time_raw = meta.map(|m| m.close_time.clone()).unwrap_or_else(|| "?".to_string());
+        let close_time = format_close_time_compact(&close_time_raw);
+        let asset = meta.map(|m| m.asset.clone()).unwrap_or_else(|| "?".to_string());
+        let condition_id = meta.map(|m| m.condition_id.clone()).unwrap_or_else(|| tok.condition_id.clone());
+        let side = meta.map(|m| m.side.clone()).unwrap_or_else(|| "?".to_string());
 
-    if let Ok(mut stmt) = conn.prepare(sql) {
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(r)) = rows.next() {
-                out.push(ClobSummary {
-                    timeframe: r.get::<usize, String>(0).unwrap_or_else(|_| "?".to_string()),
-                    tokens: r.get::<usize, i64>(1).unwrap_or(0),
-                    avg_spread: r.get::<usize, Option<f64>>(2).unwrap_or(None),
-                    avg_imb5: r.get::<usize, Option<f64>>(3).unwrap_or(None),
-                    avg_slip100: r.get::<usize, Option<f64>>(4).unwrap_or(None),
-                    last_ts: r.get::<usize, Option<String>>(5).unwrap_or(None),
-                });
-            }
+        let sv = ClobSideView {
+            token_id: token_id.clone(),
+            best_bid: tok.best_bid,
+            best_ask: tok.best_ask,
+            spread: tok.spread,
+            bid_depth5: tok.bid_depth_5,
+            ask_depth5: tok.ask_depth_5,
+            imbalance5: tok.depth_imbalance_5,
+            slip100: tok.slippage_100,
+            updated_at: tok.updated_at.to_rfc3339(),
+        };
+
+        let e = by_market.entry(condition_id.clone()).or_insert_with(|| ClobMarketRow {
+            close_time: close_time.clone(),
+            asset: asset.clone(),
+            timeframe: timeframe.clone(),
+            condition_id: condition_id.clone(),
+            up: None,
+            down: None,
+        });
+
+        if side == "UP" {
+            e.up = Some(sv);
+        } else if side == "DOWN" {
+            e.down = Some(sv);
         }
     }
 
-    out
+    let mut rows: Vec<ClobMarketRow> = by_market.into_values().collect();
+    rows.sort_by(|a, b| {
+        a.close_time.cmp(&b.close_time)
+            .then(timeframe_rank_minutes(&a.timeframe).cmp(&timeframe_rank_minutes(&b.timeframe)))
+            .then(a.condition_id.cmp(&b.condition_id))
+    });
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +215,7 @@ fn fetch_clob_summary() -> Vec<ClobSummary> {
 
 pub async fn run_tui(
     state: Arc<RwLock<AppState>>,
+    clob_state: Arc<RwLock<ClobUiState>>,
     logs: LogBuffer,
     ws_addr: String,
     ws_online: Arc<AtomicBool>,
@@ -197,7 +228,7 @@ pub async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, state, logs, ws_addr, ws_online, ws_clients).await;
+    let result = run_loop(&mut terminal, state, clob_state, logs, ws_addr, ws_online, ws_clients).await;
 
     // Always restore the terminal, even on error
     disable_raw_mode()?;
@@ -214,6 +245,7 @@ pub async fn run_tui(
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: Arc<RwLock<AppState>>,
+    clob_state: Arc<RwLock<ClobUiState>>,
     logs: LogBuffer,
     ws_addr: String,
     ws_online: Arc<AtomicBool>,
@@ -221,8 +253,8 @@ async fn run_loop(
 ) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     let mut page = Page::Oracle;
-    let mut clob_summary_cache: Vec<ClobSummary> = Vec::new();
-    let mut last_clob_refresh = Instant::now() - Duration::from_secs(10);
+    let mut clob_rows_cache: Vec<ClobMarketRow> = Vec::new();
+    let mut clob_selected: usize = 0;
 
     loop {
         ticker.tick().await;
@@ -245,16 +277,20 @@ async fn run_loop(
         let online = ws_online.load(Ordering::Relaxed);
         let clients = ws_clients.load(Ordering::Relaxed);
 
-        if matches!(page, Page::Clob) && last_clob_refresh.elapsed() >= Duration::from_secs(1) {
-            clob_summary_cache = fetch_clob_summary();
-            last_clob_refresh = Instant::now();
+        if matches!(page, Page::Clob) {
+            let cs = clob_state.read().await;
+            clob_rows_cache = build_clob_market_rows(&cs);
+            if clob_selected >= clob_rows_cache.len() {
+                clob_selected = clob_rows_cache.len().saturating_sub(1);
+            }
         }
 
         terminal.draw(|f| {
             draw(
                 f,
                 &snapshot,
-                &clob_summary_cache,
+                &clob_rows_cache,
+                clob_selected,
                 &log_lines,
                 &ws_addr,
                 online,
@@ -279,6 +315,14 @@ async fn run_loop(
                     }
                     KeyCode::Char('1') => page = Page::Oracle,
                     KeyCode::Char('2') => page = Page::Clob,
+                    KeyCode::Up if matches!(page, Page::Clob) => {
+                        clob_selected = clob_selected.saturating_sub(1);
+                    }
+                    KeyCode::Down if matches!(page, Page::Clob) => {
+                        if !clob_rows_cache.is_empty() {
+                            clob_selected = (clob_selected + 1).min(clob_rows_cache.len() - 1);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -293,7 +337,8 @@ async fn run_loop(
 fn draw(
     f: &mut Frame,
     snap: &Snapshot,
-    clob_summary: &[ClobSummary],
+    clob_rows: &[ClobMarketRow],
+    clob_selected: usize,
     log_lines: &[String],
     ws_addr: &str,
     ws_online: bool,
@@ -316,7 +361,7 @@ fn draw(
     draw_health(f, chunks[1], snap);
     match page {
         Page::Oracle => draw_prices(f, chunks[2], snap),
-        Page::Clob => draw_clob_page(f, chunks[2], clob_summary),
+        Page::Clob => draw_clob_page(f, chunks[2], clob_rows, clob_selected),
     }
     draw_logs(f, chunks[3], log_lines);
 }
@@ -480,7 +525,13 @@ fn draw_prices(f: &mut Frame, area: Rect, snap: &Snapshot) {
     draw_indicators(f, cols[2], snap);
 }
 
-fn draw_clob_page(f: &mut Frame, area: Rect, summary: &[ClobSummary]) {
+fn make_bar(v: f64, max_v: f64, width: usize, ch: char) -> String {
+    if max_v <= 0.0 || width == 0 { return "".to_string(); }
+    let n = ((v / max_v) * width as f64).round() as usize;
+    std::iter::repeat(ch).take(n.min(width)).collect::<String>()
+}
+
+fn draw_clob_page(f: &mut Frame, area: Rect, rows: &[ClobMarketRow], selected: usize) {
     let outer = Block::default()
         .title(" CLOB / L2 (BTC 5m & 15m) ")
         .borders(Borders::ALL)
@@ -489,7 +540,7 @@ fn draw_clob_page(f: &mut Frame, area: Rect, summary: &[ClobSummary]) {
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
-    if summary.is_empty() {
+    if rows.is_empty() {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
@@ -501,46 +552,110 @@ fn draw_clob_page(f: &mut Frame, area: Rect, summary: &[ClobSummary]) {
         return;
     }
 
+    let split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(inner);
+
     let header = Row::new(vec![
-        Cell::from("Timeframe"),
-        Cell::from("Tokens"),
-        Cell::from("Avg Spread"),
-        Cell::from("Avg Imb(5)"),
-        Cell::from("Avg Slip $100"),
-        Cell::from("Last TS"),
+        Cell::from("Close"),
+        Cell::from("Tok"),
+        Cell::from("TF"),
+        Cell::from("Cond"),
+        Cell::from("UP bid/ask"),
+        Cell::from("DOWN bid/ask"),
     ])
     .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
-    let rows: Vec<Row> = summary
-        .iter()
-        .map(|s| {
-            Row::new(vec![
-                Cell::from(format!("{}", s.timeframe)),
-                Cell::from(format!("{}", s.tokens)),
-                Cell::from(format!("{}", s.avg_spread.map(|v| format!("{v:.4}" )).unwrap_or_else(|| "-".into()))),
-                Cell::from(format!("{}", s.avg_imb5.map(|v| format!("{v:+.4}" )).unwrap_or_else(|| "-".into()))),
-                Cell::from(format!("{}", s.avg_slip100.map(|v| format!("{v:.4}" )).unwrap_or_else(|| "-".into()))),
-                Cell::from(s.last_ts.clone().unwrap_or_else(|| "-".into())),
-            ])
-        })
-        .collect();
+    let table_rows: Vec<Row> = rows.iter().enumerate().map(|(i, r)| {
+        let style = if i == selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let up = r.up.as_ref().map(|s| {
+            format!("{}/{}",
+                s.best_bid.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+                s.best_ask.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()))
+        }).unwrap_or_else(|| "-/-".into());
+        let down = r.down.as_ref().map(|s| {
+            format!("{}/{}",
+                s.best_bid.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+                s.best_ask.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()))
+        }).unwrap_or_else(|| "-/-".into());
+
+        Row::new(vec![
+            Cell::from(r.close_time.clone()),
+            Cell::from(r.asset.clone()),
+            Cell::from(r.timeframe.clone()),
+            Cell::from(r.condition_id.chars().take(10).collect::<String>()),
+            Cell::from(up),
+            Cell::from(down),
+        ]).style(style)
+    }).collect();
 
     let table = Table::new(
-        rows,
+        table_rows,
         [
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Length(12),
+            Constraint::Length(16),
+            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Length(12),
             Constraint::Length(14),
-            Constraint::Min(20),
+            Constraint::Length(14),
         ],
     )
     .header(header)
-    .column_spacing(2)
-    .block(Block::default().borders(Borders::NONE));
+    .column_spacing(1)
+    .block(Block::default().title("Markets (↑/↓)").borders(Borders::ALL));
+    f.render_widget(table, split[0]);
 
-    f.render_widget(table, inner);
+    let sel = &rows[selected.min(rows.len()-1)];
+    let up = sel.up.clone().unwrap_or_default();
+    let down = sel.down.clone().unwrap_or_default();
+
+    let up_bid5 = up.bid_depth5.unwrap_or(0.0);
+    let up_ask5 = up.ask_depth5.unwrap_or(0.0);
+    let up_max = up_bid5.max(up_ask5).max(1.0);
+
+    let dn_bid5 = down.bid_depth5.unwrap_or(0.0);
+    let dn_ask5 = down.ask_depth5.unwrap_or(0.0);
+    let dn_max = dn_bid5.max(dn_ask5).max(1.0);
+
+    let detail = Paragraph::new(vec![
+        Line::from(Span::styled("Selected Market", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(format!("close: {}", sel.close_time)),
+        Line::from(format!("asset: {}", sel.asset)),
+        Line::from(format!("tf: {}", sel.timeframe)),
+        Line::from(format!("condition: {}", sel.condition_id)),
+        Line::from(""),
+        Line::from(Span::styled("UP token", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(format!("id: {}", up.token_id)),
+        Line::from(format!("bid/ask: {}/{}",
+            up.best_bid.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into()),
+            up.best_ask.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into()))),
+        Line::from(format!("spread {}  imb5 {}  slip$100 {}",
+            up.spread.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into()),
+            up.imbalance5.map(|v| format!("{v:+.4}")).unwrap_or_else(|| "-".into()),
+            up.slip100.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into()))),
+        Line::from(Span::styled(format!("UP BID d5 {:>9.2} {}", up_bid5, make_bar(up_bid5, up_max, 18, '█')), Style::default().fg(Color::Green))),
+        Line::from(Span::styled(format!("UP ASK d5 {:>9.2} {}", up_ask5, make_bar(up_ask5, up_max, 18, '█')), Style::default().fg(Color::Red))),
+        Line::from(""),
+        Line::from(Span::styled("DOWN token", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from(format!("id: {}", down.token_id)),
+        Line::from(format!("bid/ask: {}/{}",
+            down.best_bid.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into()),
+            down.best_ask.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into()))),
+        Line::from(format!("spread {}  imb5 {}  slip$100 {}",
+            down.spread.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into()),
+            down.imbalance5.map(|v| format!("{v:+.4}")).unwrap_or_else(|| "-".into()),
+            down.slip100.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into()))),
+        Line::from(Span::styled(format!("DN BID d5 {:>9.2} {}", dn_bid5, make_bar(dn_bid5, dn_max, 18, '█')), Style::default().fg(Color::Green))),
+        Line::from(Span::styled(format!("DN ASK d5 {:>9.2} {}", dn_ask5, make_bar(dn_ask5, dn_max, 18, '█')), Style::default().fg(Color::Red))),
+        Line::from(format!("updated up={} dn={}", up.updated_at, down.updated_at)),
+    ])
+    .block(Block::default().title("Details (UP/DOWN)").borders(Borders::ALL));
+    f.render_widget(detail, split[1]);
 }
 
 fn draw_main_stats(f: &mut Frame, area: Rect, snap: &Snapshot) {

@@ -210,13 +210,16 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<SnapshotRow>, flush_every_ms
                         buf.push(row);
                         if buf.len() >= 1000 {
                             if let Err(e) = flush_batch(&mut conn, &mut buf) {
-                                error!(error=%e, "clob writer batch flush failed");
+                                error!(error=%e, buffered_rows=buf.len(), "clob writer batch flush failed");
+                                if let Some(dropped) = (!buf.is_empty()).then(|| buf.remove(0)) {
+                                    error!(token_id=%dropped.token_id, condition_id=%dropped.condition_id, ts=%dropped.ts.to_rfc3339(), "clob writer dropped one buffered row to recover from persistent flush failure");
+                                }
                             }
                         }
                     }
                     None => {
                         if let Err(e) = flush_batch(&mut conn, &mut buf) {
-                            error!(error=%e, "clob writer shutdown flush failed");
+                            error!(error=%e, buffered_rows=buf.len(), "clob writer shutdown flush failed");
                         }
                         break;
                     }
@@ -224,7 +227,10 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<SnapshotRow>, flush_every_ms
             }
             _ = ticker.tick() => {
                 if let Err(e) = flush_batch(&mut conn, &mut buf) {
-                    error!(error=%e, "clob writer periodic flush failed");
+                    error!(error=%e, buffered_rows=buf.len(), "clob writer periodic flush failed");
+                    if let Some(dropped) = (!buf.is_empty()).then(|| buf.remove(0)) {
+                        error!(token_id=%dropped.token_id, condition_id=%dropped.condition_id, ts=%dropped.ts.to_rfc3339(), "clob writer dropped one buffered row to recover from persistent periodic flush failure");
+                    }
                 }
             }
         }

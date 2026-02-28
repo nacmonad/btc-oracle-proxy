@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let ws_clients = Arc::new(AtomicUsize::new(0));
 
     // ── Optional CLOB writer + WS-first ingest ───────────────────────────────
+    let clob_ui_state = Arc::new(RwLock::new(clob::ClobUiState::default()));
     let mut clob_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if config.clob_enabled {
         let (writer, rx) = clob::ClobWriter::new(20_000);
@@ -51,8 +52,9 @@ async fn main() -> anyhow::Result<()> {
         }));
 
         let cfg_clob = config.clone();
+        let clob_ui_state_ws = clob_ui_state.clone();
         clob_tasks.push(tokio::spawn(async move {
-            if let Err(e) = clob::ws::run_ws_first(writer, cfg_clob).await {
+            if let Err(e) = clob::ws::run_ws_first(writer, cfg_clob, clob_ui_state_ws).await {
                 log_error!("CLOB WS-first loop error: {}", e);
             }
         }));
@@ -92,9 +94,11 @@ async fn main() -> anyhow::Result<()> {
     // ── TUI ───────────────────────────────────────────────────────────────────
     let state_tui = state.clone();
     let tui_ws_addr = config.ws_listen_addr.clone();
+    let clob_ui_state_tui = clob_ui_state.clone();
     let tui_task = tokio::spawn(async move {
         if let Err(e) = tui::run_tui(
             state_tui,
+            clob_ui_state_tui,
             log_buffer,
             tui_ws_addr,
             ws_online,

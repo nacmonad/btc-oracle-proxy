@@ -36,6 +36,10 @@ pub struct Config {
     pub clob_initial_backoff_ms: u64,
     pub clob_max_backoff_ms: u64,
     pub clob_writer_flush_ms: u64,
+    pub clob_market_refresh_ms: u64,
+    pub clob_gamma_api_url: String,
+    pub clob_sample_interval_ms: u64,
+    pub clob_sample_force_emit_ms: u64,
     pub clob_assets: Vec<String>,
     pub clob_timeframes: Vec<String>,
 }
@@ -83,6 +87,14 @@ impl Config {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(60_000),
             clob_writer_flush_ms: env::var("CLOB_WRITER_FLUSH_MS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
+            clob_market_refresh_ms: env::var("CLOB_MARKET_REFRESH_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(60_000),
+            clob_gamma_api_url: env::var("CLOB_GAMMA_API_URL")
+                .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string()),
+            clob_sample_interval_ms: env::var("CLOB_SAMPLE_INTERVAL_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(100),
+            clob_sample_force_emit_ms: env::var("CLOB_SAMPLE_FORCE_EMIT_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(2_000),
             clob_assets: env::var("CLOB_ASSETS")
                 .unwrap_or_else(|_| "BTC".to_string())
                 .split(',')
