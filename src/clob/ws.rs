@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use duckdb::{params, Connection};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use tokio::sync::RwLock;
@@ -13,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::clob::metrics::derive_l2_metrics;
 use crate::clob::state::ClobUiState;
-use crate::clob::writer::{ClobWriter, DepthLevel, SnapshotRow};
+use crate::clob::writer::{ClobWriter, DepthLevel, MarketUpsertRow, SnapshotRow};
 use crate::config::Config;
 
 type TokenRec = (String, String, String, String, String, String); // (condition_id, token_id, asset, timeframe, close_time, side)
@@ -264,68 +263,22 @@ fn parse_market_outcome(m: &serde_json::Value) -> (Option<String>, Option<f64>, 
     (outcome, winning_price, resolved_at)
 }
 
-fn upsert_markets_db(markets: &[MarketRec]) -> anyhow::Result<()> {
-    if markets.is_empty() {
-        return Ok(());
-    }
-    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "../data/researcher.db".to_string());
-    let mut conn = Connection::open(&db_path)?;
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS pm_markets (
-            condition_id         VARCHAR     PRIMARY KEY,
-            question             VARCHAR     NOT NULL,
-            asset                VARCHAR     NOT NULL,
-            timeframe            VARCHAR,
-            direction            VARCHAR,
-            close_time           TIMESTAMPTZ,
-            resolved_at          TIMESTAMPTZ,
-            outcome              VARCHAR,
-            winning_price        DOUBLE,
-            token_yes_id         VARCHAR,
-            token_no_id          VARCHAR,
-            created_at           TIMESTAMPTZ DEFAULT now(),
-            last_updated         TIMESTAMPTZ
-        );
-        CREATE INDEX IF NOT EXISTS idx_pm_markets_close_time ON pm_markets (close_time);
-        "#,
-    )?;
-    let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(r#"
-            INSERT INTO pm_markets
-                (condition_id, question, asset, timeframe, direction, close_time, resolved_at, outcome, winning_price, token_yes_id, token_no_id, last_updated)
-            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, now())
-            ON CONFLICT(condition_id) DO UPDATE SET
-                question = excluded.question,
-                asset = excluded.asset,
-                timeframe = excluded.timeframe,
-                close_time = excluded.close_time,
-                resolved_at = COALESCE(excluded.resolved_at, pm_markets.resolved_at),
-                outcome = COALESCE(excluded.outcome, pm_markets.outcome),
-                winning_price = COALESCE(excluded.winning_price, pm_markets.winning_price),
-                token_yes_id = excluded.token_yes_id,
-                token_no_id = excluded.token_no_id,
-                last_updated = now()
-        "#)?;
-
-        for m in markets {
-            stmt.execute(params![
-                m.condition_id,
-                m.question,
-                m.asset,
-                m.timeframe,
-                m.close_time,
-                m.resolved_at,
-                m.outcome,
-                m.winning_price,
-                m.token_yes_id,
-                m.token_no_id,
-            ])?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
+fn to_market_upserts(markets: &[MarketRec]) -> Vec<MarketUpsertRow> {
+    markets
+        .iter()
+        .map(|m| MarketUpsertRow {
+            condition_id: m.condition_id.clone(),
+            question: m.question.clone(),
+            asset: m.asset.clone(),
+            timeframe: m.timeframe.clone(),
+            close_time: m.close_time.clone(),
+            resolved_at: m.resolved_at.clone(),
+            outcome: m.outcome.clone(),
+            winning_price: m.winning_price,
+            token_yes_id: m.token_yes_id.clone(),
+            token_no_id: m.token_no_id.clone(),
+        })
+        .collect()
 }
 
 async fn load_active_tokens(cfg: &Config) -> anyhow::Result<DiscoveryBatch> {
@@ -438,8 +391,9 @@ pub async fn run_ws_first(writer: ClobWriter, cfg: Config, ui_state: Arc<RwLock<
             }
         };
 
-        if let Err(e) = upsert_markets_db(&discovery.markets) {
-            warn!(error=%e, "failed to upsert discovered markets into pm_markets");
+        let market_rows = to_market_upserts(&discovery.markets);
+        if !market_rows.is_empty() && !writer.try_enqueue_markets(market_rows) {
+            warn!("db writer queue full; dropping market upsert batch");
         }
 
         let tokens = discovery.tokens;
@@ -487,7 +441,7 @@ pub async fn run_ws_first(writer: ClobWriter, cfg: Config, ui_state: Arc<RwLock<
                         _ = sample_tick.tick() => {
                             let sampled_rows = sampler.take_ready(Utc::now());
                             for row in sampled_rows {
-                                if !writer.try_enqueue(row) {
+                                if !writer.try_enqueue_snapshot(row) {
                                     {
                                         let mut s = ui_state.write().await;
                                         s.on_drop();

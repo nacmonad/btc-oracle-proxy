@@ -11,7 +11,6 @@ mod http_api;
 mod monitoring;
 mod tui;
 mod clob;
-mod oracle_db;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -42,33 +41,24 @@ async fn main() -> anyhow::Result<()> {
     let ws_online = Arc::new(AtomicBool::new(false));
     let ws_clients = Arc::new(AtomicUsize::new(0));
 
-    // ── Oracle DB writer (oracle_ticks + signal_events) ──────────────────────
-    let (oracle_writer, oracle_rx) = oracle_db::OracleDbWriter::new(20_000);
-    tokio::spawn(async move {
-        oracle_db::run_writer_loop(oracle_rx, 500).await;
-    });
-
-    // ── Optional CLOB writer + WS-first ingest ───────────────────────────────
+    // ── Shared DB writer queue (single DuckDB writer task) ──────────────────
     let clob_ui_state = Arc::new(RwLock::new(clob::ClobUiState::default()));
     let mut clob_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    if config.clob_enabled {
-        let (writer, rx) = clob::ClobWriter::new(20_000);
-        let flush_ms = config.clob_writer_flush_ms;
-        let clob_ui_state_writer = clob_ui_state.clone();
-        clob_tasks.push(tokio::spawn(async move {
-            clob::writer::run_writer_loop(rx, flush_ms, clob_ui_state_writer).await;
-        }));
+    let (db_writer, rx) = clob::ClobWriter::new(100_000);
+    let flush_ms = config.clob_writer_flush_ms;
+    let clob_ui_state_writer = clob_ui_state.clone();
+    clob_tasks.push(tokio::spawn(async move {
+        clob::writer::run_writer_loop(rx, flush_ms, clob_ui_state_writer).await;
+    }));
 
+    if config.clob_enabled {
         let cfg_clob = config.clone();
         let clob_ui_state_ws = clob_ui_state.clone();
+        let db_writer_ws = db_writer.clone();
         clob_tasks.push(tokio::spawn(async move {
-            if let Err(e) = clob::ws::run_ws_first(writer, cfg_clob, clob_ui_state_ws).await {
+            if let Err(e) = clob::ws::run_ws_first(db_writer_ws, cfg_clob, clob_ui_state_ws).await {
                 log_error!("CLOB WS-first loop error: {}", e);
             }
-        }));
-
-        clob_tasks.push(tokio::spawn(async move {
-            clob::outcome_local::run_local_outcome_loop(30_000).await;
         }));
 
         info!("CLOB WS-first ingestion enabled");
@@ -78,9 +68,9 @@ async fn main() -> anyhow::Result<()> {
     let state_agg = state.clone();
     let cfg_agg = config.clone();
     let tx_agg = event_tx.clone();
-    let oracle_writer_agg = oracle_writer.clone();
+    let db_writer_agg = db_writer.clone();
     let aggregator_task = tokio::spawn(async move {
-        if let Err(e) = aggregator::run_aggregator(state_agg, cfg_agg, tx_agg, oracle_writer_agg).await {
+        if let Err(e) = aggregator::run_aggregator(state_agg, cfg_agg, tx_agg, db_writer_agg).await {
             log_error!("Aggregator error: {}", e);
         }
     });

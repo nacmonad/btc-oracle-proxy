@@ -799,7 +799,7 @@ GET /health
   - deleted order-book levels: 2,928,798
 
 ### Remaining Work (besides observing runtime for 48h)
-1. Add writer/ingest observability in logs/TUI (rows/sec, levels/sec, malformed/skipped counters).
+1. Validate new single DuckDB writer queue under sustained load (all writes serialized through one queue/task).
 2. Confirm `pm_markets` metadata joins (timeframe/close_time) are fully populated for post-hoc analytics.
 3. Decide long-term retention policy for `pm_order_book_levels` (always-on vs periodic/sample-only).
 4. Add/verify DB indexes and run query-latency sanity checks after sustained ingest.
