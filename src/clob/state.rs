@@ -31,6 +31,7 @@ pub struct MarketMeta {
     pub close_time: String,
     pub token_id: String,
     pub side: String, // UP | DOWN
+    pub pivot: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,8 +87,8 @@ impl ClobUiState {
         self.writer_recovered_drops = recovered_drops;
     }
 
-    pub fn set_market_meta(&mut self, token_id: String, condition_id: String, asset: String, timeframe: String, close_time: String, side: String) {
-        self.markets.insert(token_id.clone(), MarketMeta { token_id, condition_id, asset, timeframe, close_time, side });
+    pub fn set_market_meta(&mut self, token_id: String, condition_id: String, asset: String, timeframe: String, close_time: String, side: String, pivot: Option<f64>) {
+        self.markets.insert(token_id.clone(), MarketMeta { token_id, condition_id, asset, timeframe, close_time, side, pivot });
     }
 
     pub fn update_from_row(&mut self, row: &SnapshotRow) {

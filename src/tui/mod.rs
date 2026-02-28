@@ -67,6 +67,7 @@ struct ClobMarketRow {
     asset: String,
     timeframe: String,
     condition_id: String,
+    pivot: Option<f64>,
     up: Option<ClobSideView>,
     down: Option<ClobSideView>,
 }
@@ -211,6 +212,7 @@ fn build_clob_market_rows(state: &ClobUiState) -> Vec<ClobMarketRow> {
         let asset = meta.map(|m| m.asset.clone()).unwrap_or_else(|| "?".to_string());
         let condition_id = meta.map(|m| m.condition_id.clone()).unwrap_or_else(|| tok.condition_id.clone());
         let side = meta.map(|m| m.side.clone()).unwrap_or_else(|| "?".to_string());
+        let pivot = meta.and_then(|m| m.pivot);
 
         let sv = ClobSideView {
             token_id: token_id.clone(),
@@ -229,9 +231,13 @@ fn build_clob_market_rows(state: &ClobUiState) -> Vec<ClobMarketRow> {
             asset: asset.clone(),
             timeframe: timeframe.clone(),
             condition_id: condition_id.clone(),
+            pivot,
             up: None,
             down: None,
         });
+        if e.pivot.is_none() {
+            e.pivot = pivot;
+        }
 
         if side == "UP" {
             e.up = Some(sv);
@@ -409,7 +415,7 @@ fn draw(
     draw_health(f, chunks[1], snap);
     match page {
         Page::Oracle => draw_prices(f, chunks[2], snap),
-        Page::Clob => draw_clob_page(f, chunks[2], clob_rows, clob_selected),
+        Page::Clob => draw_clob_page(f, chunks[2], clob_rows, clob_selected, snap),
         Page::Ingest => draw_ingest_page(f, chunks[2], clob_diag),
     }
     draw_logs(f, chunks[3], log_lines);
@@ -581,7 +587,7 @@ fn make_bar(v: f64, max_v: f64, width: usize, ch: char) -> String {
     std::iter::repeat(ch).take(n.min(width)).collect::<String>()
 }
 
-fn draw_clob_page(f: &mut Frame, area: Rect, rows: &[ClobMarketRow], selected: usize) {
+fn draw_clob_page(f: &mut Frame, area: Rect, rows: &[ClobMarketRow], selected: usize, snap: &Snapshot) {
     let outer = Block::default()
         .title(" CLOB / L2 (BTC 5m & 15m) ")
         .borders(Borders::ALL)
@@ -602,10 +608,31 @@ fn draw_clob_page(f: &mut Frame, area: Rect, rows: &[ClobMarketRow], selected: u
         return;
     }
 
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(0)])
+        .split(inner);
+
+    let market_str = snap.market_price.map(|p| format!("{p:.4}")).unwrap_or_else(|| "-".into());
+    let dev_str = snap.deviation_pct.map(|d| format!("{d:+.3}%")).unwrap_or_else(|| "-".into());
+    let age_str = snap.chainlink_age_secs.map(|a| format!("{a}s")).unwrap_or_else(|| "-".into());
+    let global_anchor = snap.chainlink_price.map(|p| format!("{p:.4}")).unwrap_or_else(|| "-".into());
+
+    let pivot_5m = rows.iter().find(|r| r.timeframe == "5m").and_then(|r| r.pivot).map(|p| format!("{p:.4}")).unwrap_or_else(|| "-".into());
+    let pivot_15m = rows.iter().find(|r| r.timeframe == "15m").and_then(|r| r.pivot).map(|p| format!("{p:.4}")).unwrap_or_else(|| "-".into());
+
+    let pivot_panel = Paragraph::new(vec![
+        Line::from(Span::styled("Feed / Pivots", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(format!("pivot 5m: {}   pivot 15m: {}", pivot_5m, pivot_15m)),
+        Line::from(format!("chainlink now: {} (age {})   market: {}   dev: {}", global_anchor, age_str, market_str, dev_str)),
+    ])
+    .block(Block::default().borders(Borders::ALL).title("Oracle Anchor"));
+    f.render_widget(pivot_panel, v[0]);
+
     let split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(inner);
+        .split(v[1]);
 
     let header = Row::new(vec![
         Cell::from("Close"),
@@ -678,6 +705,7 @@ fn draw_clob_page(f: &mut Frame, area: Rect, rows: &[ClobMarketRow], selected: u
         Line::from(format!("asset: {}", sel.asset)),
         Line::from(format!("tf: {}", sel.timeframe)),
         Line::from(format!("condition: {}", sel.condition_id)),
+        Line::from(format!("pivot(tf): {}", sel.pivot.map(|p| format!("{p:.4}")).unwrap_or_else(|| "-".into()))),
         Line::from(""),
         Line::from(Span::styled("UP token", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(format!("id: {}", up.token_id)),

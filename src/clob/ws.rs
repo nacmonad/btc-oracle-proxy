@@ -202,6 +202,27 @@ fn extract_tokens(m: &serde_json::Value) -> Option<(String, String)> {
     None
 }
 
+fn parse_pivot_from_question(q: &str) -> Option<f64> {
+    let mut num = String::new();
+    let mut found = Vec::new();
+    for ch in q.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            num.push(ch);
+        } else if !num.is_empty() {
+            if let Ok(v) = num.parse::<f64>() {
+                found.push(v);
+            }
+            num.clear();
+        }
+    }
+    if !num.is_empty() {
+        if let Ok(v) = num.parse::<f64>() {
+            found.push(v);
+        }
+    }
+    found.into_iter().max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+}
+
 fn parse_market_outcome(m: &serde_json::Value) -> (Option<String>, Option<f64>, Option<String>) {
     let closed = m.get("closed").and_then(|x| x.as_bool()).unwrap_or(false);
     let mut outcome: Option<String> = None;
@@ -391,6 +412,12 @@ pub async fn run_ws_first(writer: ClobWriter, cfg: Config, ui_state: Arc<RwLock<
             }
         };
 
+        let pivot_by_condition: HashMap<String, Option<f64>> = discovery
+            .markets
+            .iter()
+            .map(|m| (m.condition_id.clone(), parse_pivot_from_question(&m.question)))
+            .collect();
+
         let market_rows = to_market_upserts(&discovery.markets);
         if !market_rows.is_empty() && !writer.try_enqueue_markets(market_rows) {
             warn!("db writer queue full; dropping market upsert batch");
@@ -414,9 +441,13 @@ pub async fn run_ws_first(writer: ClobWriter, cfg: Config, ui_state: Arc<RwLock<
                 let (mut write, mut read) = ws.split();
                 {
                     let mut s = ui_state.write().await;
+                    // Reset view-state mappings on each fresh discovery cycle to avoid
+                    // stale tokens rendering as "? ?" in TUI when markets roll.
+                    s.tokens.clear();
                     s.markets.clear();
                     for (cid, token, asset, tf, ct, side) in &tokens {
-                        s.set_market_meta(token.clone(), cid.clone(), asset.clone(), tf.clone(), ct.clone(), side.clone());
+                        let pivot = pivot_by_condition.get(cid).cloned().unwrap_or(None);
+                        s.set_market_meta(token.clone(), cid.clone(), asset.clone(), tf.clone(), ct.clone(), side.clone(), pivot);
                     }
                 }
 
@@ -548,13 +579,7 @@ async fn handle_message(
             None => continue,
         };
 
-        // Hard gate: DB snapshot path only for currently active 5m/15m window tokens.
-        // This intentionally drops lookahead-window tokens before heavy metric work.
-        if !should_persist_market_now(&timeframe, &close_time, Utc::now()) {
-            let mut s = ui_state.write().await;
-            s.on_skipped_non_current();
-            continue;
-        }
+        let persist_now = should_persist_market_now(&timeframe, &close_time, Utc::now());
 
         let parse_levels = |arr: Option<&Vec<serde_json::Value>>| -> Vec<crate::clob::BookLevel> {
             arr.unwrap_or(&Vec::new())
@@ -628,7 +653,12 @@ async fn handle_message(
             }
         }
 
-        sampler.ingest(row);
+        if persist_now {
+            sampler.ingest(row);
+        } else {
+            let mut s = ui_state.write().await;
+            s.on_skipped_non_current();
+        }
     }
 
     Ok(())
