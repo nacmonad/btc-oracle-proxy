@@ -94,26 +94,30 @@ fn open_db() -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
-fn flush_batch(conn: &mut Connection, rows: &mut Vec<WsEvent>) -> anyhow::Result<()> {
+fn flush_batch(conn: &mut Connection, rows: &mut Vec<WsEvent>, write_ticks: bool) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
 
     let tx = conn.transaction()?;
     {
-        let mut tick_stmt = tx.prepare(
-            r#"
-            INSERT OR IGNORE INTO oracle_ticks
-                (ts, symbol, market_price, chainlink_price, chainlink_age_secs,
-                 deviation_pct, round_imminent,
-                 price_binance, price_coinbase, price_kraken,
-                 ema_12, ema_26, ema_50, rsi_14,
-                 momentum_10, momentum_20, volatility,
-                 bb_upper, bb_middle, bb_lower,
-                 macd, macd_signal, macd_histogram)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            "#,
-        )?;
+        let mut tick_stmt = if write_ticks {
+            Some(tx.prepare(
+                r#"
+                INSERT OR IGNORE INTO oracle_ticks
+                    (ts, symbol, market_price, chainlink_price, chainlink_age_secs,
+                     deviation_pct, round_imminent,
+                     price_binance, price_coinbase, price_kraken,
+                     ema_12, ema_26, ema_50, rsi_14,
+                     momentum_10, momentum_20, volatility,
+                     bb_upper, bb_middle, bb_lower,
+                     macd, macd_signal, macd_histogram)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                "#,
+            )?)
+        } else {
+            None
+        };
 
         let mut sig_stmt = tx.prepare(
             r#"
@@ -131,31 +135,33 @@ fn flush_batch(conn: &mut Connection, rows: &mut Vec<WsEvent>) -> anyhow::Result
         for evt in rows.iter() {
             match evt {
                 WsEvent::Tick { ts, data } => {
-                    tick_stmt.execute(params![
-                        ts.to_rfc3339(),
-                        data.symbol,
-                        data.market_price,
-                        data.chainlink_price,
-                        data.chainlink_age_secs.map(|v| v as i64),
-                        data.deviation_pct,
-                        data.round_imminent,
-                        data.exchange_prices.get("binance").copied(),
-                        data.exchange_prices.get("coinbase").copied(),
-                        data.exchange_prices.get("kraken").copied(),
-                        data.indicators.ema_12,
-                        data.indicators.ema_26,
-                        data.indicators.ema_50,
-                        data.indicators.rsi_14,
-                        data.indicators.momentum_10,
-                        data.indicators.momentum_20,
-                        data.indicators.volatility,
-                        data.indicators.bb_upper,
-                        data.indicators.bb_middle,
-                        data.indicators.bb_lower,
-                        data.indicators.macd,
-                        data.indicators.macd_signal,
-                        data.indicators.macd_histogram,
-                    ])?;
+                    if let Some(tick_stmt) = tick_stmt.as_mut() {
+                        tick_stmt.execute(params![
+                            ts.to_rfc3339(),
+                            data.symbol,
+                            data.market_price,
+                            data.chainlink_price,
+                            data.chainlink_age_secs.map(|v| v as i64),
+                            data.deviation_pct,
+                            data.round_imminent,
+                            data.exchange_prices.get("binance").copied(),
+                            data.exchange_prices.get("coinbase").copied(),
+                            data.exchange_prices.get("kraken").copied(),
+                            data.indicators.ema_12,
+                            data.indicators.ema_26,
+                            data.indicators.ema_50,
+                            data.indicators.rsi_14,
+                            data.indicators.momentum_10,
+                            data.indicators.momentum_20,
+                            data.indicators.volatility,
+                            data.indicators.bb_upper,
+                            data.indicators.bb_middle,
+                            data.indicators.bb_lower,
+                            data.indicators.macd,
+                            data.indicators.macd_signal,
+                            data.indicators.macd_histogram,
+                        ])?;
+                    }
                 }
                 WsEvent::PreTriggerAlert { ts, data } => {
                     let raw_json = serde_json::to_string(evt).ok();
@@ -308,6 +314,11 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<WsEvent>, flush_every_ms: u6
         }
     };
 
+    let write_ticks = env::var("ORACLE_WRITE_TICKS")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    info!(write_ticks, "oracle writer tick archival mode");
+
     let mut buf: Vec<WsEvent> = Vec::with_capacity(512);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(flush_every_ms.max(100)));
 
@@ -318,14 +329,14 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<WsEvent>, flush_every_ms: u6
                     Some(evt) => {
                         buf.push(evt);
                         if buf.len() >= 256 {
-                            if let Err(e) = flush_batch(&mut conn, &mut buf) {
+                            if let Err(e) = flush_batch(&mut conn, &mut buf, write_ticks) {
                                 error!(error=%e, "oracle writer batch flush failed");
                                 if !buf.is_empty() { buf.remove(0); }
                             }
                         }
                     }
                     None => {
-                        if let Err(e) = flush_batch(&mut conn, &mut buf) {
+                        if let Err(e) = flush_batch(&mut conn, &mut buf, write_ticks) {
                             error!(error=%e, "oracle writer shutdown flush failed");
                         }
                         break;
@@ -333,7 +344,7 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<WsEvent>, flush_every_ms: u6
                 }
             }
             _ = ticker.tick() => {
-                if let Err(e) = flush_batch(&mut conn, &mut buf) {
+                if let Err(e) = flush_batch(&mut conn, &mut buf, write_ticks) {
                     error!(error=%e, "oracle writer periodic flush failed");
                     if !buf.is_empty() { buf.remove(0); }
                 }

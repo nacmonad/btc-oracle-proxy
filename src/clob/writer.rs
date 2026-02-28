@@ -132,7 +132,7 @@ fn ts_sql(ts: &DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>) -> anyhow::Result<()> {
+fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>, write_levels: bool) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -167,13 +167,17 @@ fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>) -> anyhow::Re
             "
         )?;
 
-        let mut lvl_stmt = tx.prepare(
-            "
-            INSERT INTO pm_order_book_levels (
-                ts, condition_id, token_id, side, level, price, size, cumulative_size, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "
-        )?;
+        let mut lvl_stmt = if write_levels {
+            Some(tx.prepare(
+                "
+                INSERT INTO pm_order_book_levels (
+                    ts, condition_id, token_id, side, level, price, size, cumulative_size, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "
+            )?)
+        } else {
+            None
+        };
 
         for r in rows.iter() {
             snap_stmt.execute(params![
@@ -202,38 +206,40 @@ fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>) -> anyhow::Re
                 r.last_trade_size,
             ])?;
 
-            // Full depth archival (BID side)
-            let mut cumulative = 0.0f64;
-            for (idx, lvl) in r.bid_levels.iter().enumerate() {
-                cumulative += lvl.size;
-                lvl_stmt.execute(params![
-                    ts_sql(&r.ts),
-                    r.condition_id,
-                    r.token_id,
-                    "BID",
-                    (idx as i32) + 1,
-                    lvl.price,
-                    lvl.size,
-                    cumulative,
-                    r.source,
-                ])?;
-            }
+            if let Some(lvl_stmt) = lvl_stmt.as_mut() {
+                // Full depth archival (BID side)
+                let mut cumulative = 0.0f64;
+                for (idx, lvl) in r.bid_levels.iter().enumerate() {
+                    cumulative += lvl.size;
+                    lvl_stmt.execute(params![
+                        ts_sql(&r.ts),
+                        r.condition_id,
+                        r.token_id,
+                        "BID",
+                        (idx as i32) + 1,
+                        lvl.price,
+                        lvl.size,
+                        cumulative,
+                        r.source,
+                    ])?;
+                }
 
-            // Full depth archival (ASK side)
-            cumulative = 0.0;
-            for (idx, lvl) in r.ask_levels.iter().enumerate() {
-                cumulative += lvl.size;
-                lvl_stmt.execute(params![
-                    ts_sql(&r.ts),
-                    r.condition_id,
-                    r.token_id,
-                    "ASK",
-                    (idx as i32) + 1,
-                    lvl.price,
-                    lvl.size,
-                    cumulative,
-                    r.source,
-                ])?;
+                // Full depth archival (ASK side)
+                cumulative = 0.0;
+                for (idx, lvl) in r.ask_levels.iter().enumerate() {
+                    cumulative += lvl.size;
+                    lvl_stmt.execute(params![
+                        ts_sql(&r.ts),
+                        r.condition_id,
+                        r.token_id,
+                        "ASK",
+                        (idx as i32) + 1,
+                        lvl.price,
+                        lvl.size,
+                        cumulative,
+                        r.source,
+                    ])?;
+                }
             }
         }
     }
@@ -253,6 +259,11 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<SnapshotRow>, flush_every_ms
         }
     };
 
+    let write_levels = std::env::var("CLOB_WRITE_LEVELS")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    info!(write_levels, "clob writer level archival mode");
+
     let mut buf: Vec<SnapshotRow> = Vec::with_capacity(2048);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(flush_every_ms));
     let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -268,7 +279,7 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<SnapshotRow>, flush_every_ms
                         received_rows += 1;
                         buf.push(row);
                         if buf.len() >= 1000 {
-                            if let Err(e) = flush_batch(&mut conn, &mut buf) {
+                            if let Err(e) = flush_batch(&mut conn, &mut buf, write_levels) {
                                 flush_error_count += 1;
                                 error!(buffered_rows=buf.len(), flush_error_count, "clob writer batch flush failed: {:#}", e);
                                 if let Some(dropped) = (!buf.is_empty()).then(|| buf.remove(0)) {
@@ -279,7 +290,7 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<SnapshotRow>, flush_every_ms
                         }
                     }
                     None => {
-                        if let Err(e) = flush_batch(&mut conn, &mut buf) {
+                        if let Err(e) = flush_batch(&mut conn, &mut buf, write_levels) {
                             error!(buffered_rows=buf.len(), "clob writer shutdown flush failed: {:#}", e);
                         }
                         break;
@@ -287,7 +298,7 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<SnapshotRow>, flush_every_ms
                 }
             }
             _ = ticker.tick() => {
-                if let Err(e) = flush_batch(&mut conn, &mut buf) {
+                if let Err(e) = flush_batch(&mut conn, &mut buf, write_levels) {
                     flush_error_count += 1;
                     error!(buffered_rows=buf.len(), flush_error_count, "clob writer periodic flush failed: {:#}", e);
                     if let Some(dropped) = (!buf.is_empty()).then(|| buf.remove(0)) {
