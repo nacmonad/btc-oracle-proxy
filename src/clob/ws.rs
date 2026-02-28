@@ -548,6 +548,14 @@ async fn handle_message(
             None => continue,
         };
 
+        // Hard gate: DB snapshot path only for currently active 5m/15m window tokens.
+        // This intentionally drops lookahead-window tokens before heavy metric work.
+        if !should_persist_market_now(&timeframe, &close_time, Utc::now()) {
+            let mut s = ui_state.write().await;
+            s.on_skipped_non_current();
+            continue;
+        }
+
         let parse_levels = |arr: Option<&Vec<serde_json::Value>>| -> Vec<crate::clob::BookLevel> {
             arr.unwrap_or(&Vec::new())
                 .iter()
@@ -620,12 +628,7 @@ async fn handle_message(
             }
         }
 
-        if should_persist_market_now(&timeframe, &close_time, Utc::now()) {
-            sampler.ingest(row);
-        } else {
-            let mut s = ui_state.write().await;
-            s.on_skipped_non_current();
-        }
+        sampler.ingest(row);
     }
 
     Ok(())
