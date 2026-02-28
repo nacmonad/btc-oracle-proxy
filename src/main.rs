@@ -11,6 +11,7 @@ mod http_api;
 mod monitoring;
 mod tui;
 mod clob;
+mod oracle_db;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -41,6 +42,12 @@ async fn main() -> anyhow::Result<()> {
     let ws_online = Arc::new(AtomicBool::new(false));
     let ws_clients = Arc::new(AtomicUsize::new(0));
 
+    // ── Oracle DB writer (oracle_ticks + signal_events) ──────────────────────
+    let (oracle_writer, oracle_rx) = oracle_db::OracleDbWriter::new(20_000);
+    tokio::spawn(async move {
+        oracle_db::run_writer_loop(oracle_rx, 500).await;
+    });
+
     // ── Optional CLOB writer + WS-first ingest ───────────────────────────────
     let clob_ui_state = Arc::new(RwLock::new(clob::ClobUiState::default()));
     let mut clob_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -67,8 +74,9 @@ async fn main() -> anyhow::Result<()> {
     let state_agg = state.clone();
     let cfg_agg = config.clone();
     let tx_agg = event_tx.clone();
+    let oracle_writer_agg = oracle_writer.clone();
     let aggregator_task = tokio::spawn(async move {
-        if let Err(e) = aggregator::run_aggregator(state_agg, cfg_agg, tx_agg).await {
+        if let Err(e) = aggregator::run_aggregator(state_agg, cfg_agg, tx_agg, oracle_writer_agg).await {
             log_error!("Aggregator error: {}", e);
         }
     });

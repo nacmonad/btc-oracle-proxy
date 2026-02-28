@@ -7,6 +7,7 @@ pub mod exchange_client;
 use crate::config::Config;
 use crate::error::OracleResult;
 use crate::indicators::{self, IndicatorConfig};
+use crate::oracle_db::OracleDbWriter;
 use crate::models::{
     AppState, BbBreakoutEvent, DeviationApproachEvent, ExchangePrice, ExchangeStatus,
     PreTriggerAlertEvent, PriceUpdate, RoundDirection, RoundSettledEvent, RoundTriggeredEvent,
@@ -31,6 +32,7 @@ pub async fn run_aggregator(
     state: Arc<RwLock<AppState>>,
     config: Config,
     event_tx: broadcast::Sender<WsEvent>,
+    oracle_writer: OracleDbWriter,
 ) -> OracleResult<()> {
     info!("Starting price aggregator...");
 
@@ -340,7 +342,10 @@ pub async fn run_aggregator(
 
                 for evt in outbound {
                     // Ignore SendError (no subscribers yet is fine)
-                    let _ = event_tx.send(evt);
+                    let _ = event_tx.send(evt.clone());
+                    if !oracle_writer.try_enqueue(evt) {
+                        warn!("oracle db writer queue full; dropping ws event");
+                    }
                 }
 
                 // ── Periodic status log (every ~30s) ───────────────────────
