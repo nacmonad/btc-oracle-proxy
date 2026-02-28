@@ -270,6 +270,26 @@ fn upsert_markets_db(markets: &[MarketRec]) -> anyhow::Result<()> {
     }
     let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "../data/researcher.db".to_string());
     let mut conn = Connection::open(&db_path)?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS pm_markets (
+            condition_id         VARCHAR     PRIMARY KEY,
+            question             VARCHAR     NOT NULL,
+            asset                VARCHAR     NOT NULL,
+            timeframe            VARCHAR,
+            direction            VARCHAR,
+            close_time           TIMESTAMPTZ,
+            resolved_at          TIMESTAMPTZ,
+            outcome              VARCHAR,
+            winning_price        DOUBLE,
+            token_yes_id         VARCHAR,
+            token_no_id          VARCHAR,
+            created_at           TIMESTAMPTZ DEFAULT now(),
+            last_updated         TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_pm_markets_close_time ON pm_markets (close_time);
+        "#,
+    )?;
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare(r#"

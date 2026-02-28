@@ -77,6 +77,52 @@ fn open_db() -> anyhow::Result<Connection> {
 
     let conn = Connection::open(&db_path)?;
     conn.execute("SET threads TO 4", [])?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS pm_snapshots (
+            ts                   TIMESTAMPTZ NOT NULL,
+            condition_id         VARCHAR     NOT NULL,
+            token_id             VARCHAR     NOT NULL,
+            best_bid             DOUBLE,
+            best_ask             DOUBLE,
+            mid_price            DOUBLE,
+            spread               DOUBLE,
+            bid_depth_1          DOUBLE,
+            ask_depth_1          DOUBLE,
+            bid_depth_5          DOUBLE,
+            ask_depth_5          DOUBLE,
+            bid_depth_10         DOUBLE,
+            ask_depth_10         DOUBLE,
+            depth_imbalance_5    DOUBLE,
+            depth_imbalance_10   DOUBLE,
+            slippage_100         DOUBLE,
+            slippage_1000        DOUBLE,
+            total_bid_levels     INTEGER,
+            total_ask_levels     INTEGER,
+            book_timestamp       BIGINT,
+            source               VARCHAR,
+            last_trade_price     DOUBLE,
+            last_trade_size      DOUBLE,
+            PRIMARY KEY (ts, token_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS pm_order_book_levels (
+            ts                   TIMESTAMPTZ NOT NULL,
+            condition_id         VARCHAR     NOT NULL,
+            token_id             VARCHAR     NOT NULL,
+            side                 VARCHAR     NOT NULL,
+            level                INTEGER     NOT NULL,
+            price                DOUBLE      NOT NULL,
+            size                 DOUBLE      NOT NULL,
+            cumulative_size      DOUBLE,
+            source               VARCHAR,
+            PRIMARY KEY (ts, token_id, side, level)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pm_snapshots_cond ON pm_snapshots (condition_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_ob_levels_token_ts ON pm_order_book_levels (token_id, ts);
+        "#,
+    )?;
     info!(db_path=%db_path, "clob writer connected to duckdb");
     Ok(conn)
 }
