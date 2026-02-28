@@ -1,8 +1,11 @@
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection};
 use std::path::Path;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
+
+use crate::clob::state::ClobUiState;
 
 #[derive(Debug, Clone)]
 pub struct DepthLevel {
@@ -190,7 +193,7 @@ fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>) -> anyhow::Re
     Ok(())
 }
 
-pub async fn run_writer_loop(mut rx: mpsc::Receiver<SnapshotRow>, flush_every_ms: u64) {
+pub async fn run_writer_loop(mut rx: mpsc::Receiver<SnapshotRow>, flush_every_ms: u64, ui_state: Arc<RwLock<ClobUiState>>) {
     let mut conn = match open_db() {
         Ok(c) => c,
         Err(e) => {
@@ -201,25 +204,32 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<SnapshotRow>, flush_every_ms
 
     let mut buf: Vec<SnapshotRow> = Vec::with_capacity(2048);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(flush_every_ms));
+    let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut received_rows: u64 = 0;
+    let mut flush_error_count: u64 = 0;
+    let mut recovered_drop_count: u64 = 0;
 
     loop {
         tokio::select! {
             maybe = rx.recv() => {
                 match maybe {
                     Some(row) => {
+                        received_rows += 1;
                         buf.push(row);
                         if buf.len() >= 1000 {
                             if let Err(e) = flush_batch(&mut conn, &mut buf) {
-                                error!(error=%e, buffered_rows=buf.len(), "clob writer batch flush failed");
+                                flush_error_count += 1;
+                                error!(buffered_rows=buf.len(), flush_error_count, "clob writer batch flush failed: {:#}", e);
                                 if let Some(dropped) = (!buf.is_empty()).then(|| buf.remove(0)) {
-                                    error!(token_id=%dropped.token_id, condition_id=%dropped.condition_id, ts=%dropped.ts.to_rfc3339(), "clob writer dropped one buffered row to recover from persistent flush failure");
+                                    recovered_drop_count += 1;
+                                    error!(token_id=%dropped.token_id, condition_id=%dropped.condition_id, ts=%dropped.ts.to_rfc3339(), recovered_drop_count, "clob writer dropped one buffered row to recover from persistent flush failure");
                                 }
                             }
                         }
                     }
                     None => {
                         if let Err(e) = flush_batch(&mut conn, &mut buf) {
-                            error!(error=%e, buffered_rows=buf.len(), "clob writer shutdown flush failed");
+                            error!(buffered_rows=buf.len(), "clob writer shutdown flush failed: {:#}", e);
                         }
                         break;
                     }
@@ -227,11 +237,26 @@ pub async fn run_writer_loop(mut rx: mpsc::Receiver<SnapshotRow>, flush_every_ms
             }
             _ = ticker.tick() => {
                 if let Err(e) = flush_batch(&mut conn, &mut buf) {
-                    error!(error=%e, buffered_rows=buf.len(), "clob writer periodic flush failed");
+                    flush_error_count += 1;
+                    error!(buffered_rows=buf.len(), flush_error_count, "clob writer periodic flush failed: {:#}", e);
                     if let Some(dropped) = (!buf.is_empty()).then(|| buf.remove(0)) {
-                        error!(token_id=%dropped.token_id, condition_id=%dropped.condition_id, ts=%dropped.ts.to_rfc3339(), "clob writer dropped one buffered row to recover from persistent periodic flush failure");
+                        recovered_drop_count += 1;
+                        error!(token_id=%dropped.token_id, condition_id=%dropped.condition_id, ts=%dropped.ts.to_rfc3339(), recovered_drop_count, "clob writer dropped one buffered row to recover from persistent periodic flush failure");
                     }
                 }
+            }
+            _ = stats_tick.tick() => {
+                {
+                    let mut s = ui_state.write().await;
+                    s.set_writer_stats(received_rows, buf.len() as u64, flush_error_count, recovered_drop_count);
+                }
+                info!(
+                    writer_received_rows=received_rows,
+                    writer_buffered_rows=buf.len(),
+                    writer_flush_errors=flush_error_count,
+                    writer_recovered_drops=recovered_drop_count,
+                    "clob writer stats"
+                );
             }
         }
     }

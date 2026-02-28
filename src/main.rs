@@ -47,8 +47,9 @@ async fn main() -> anyhow::Result<()> {
     if config.clob_enabled {
         let (writer, rx) = clob::ClobWriter::new(20_000);
         let flush_ms = config.clob_writer_flush_ms;
+        let clob_ui_state_writer = clob_ui_state.clone();
         clob_tasks.push(tokio::spawn(async move {
-            clob::writer::run_writer_loop(rx, flush_ms).await;
+            clob::writer::run_writer_loop(rx, flush_ms, clob_ui_state_writer).await;
         }));
 
         let cfg_clob = config.clone();

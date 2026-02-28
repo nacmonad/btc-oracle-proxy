@@ -45,6 +45,7 @@ pub fn new_log_buffer() -> LogBuffer {
 enum Page {
     Oracle,
     Clob,
+    Ingest,
 }
 
 #[derive(Clone, Default)]
@@ -68,6 +69,25 @@ struct ClobMarketRow {
     condition_id: String,
     up: Option<ClobSideView>,
     down: Option<ClobSideView>,
+}
+
+#[derive(Clone, Default)]
+struct ClobDiag {
+    reconnects: u64,
+    dropped_rows: u64,
+    enqueued_rows: u64,
+    malformed_rows: u64,
+    skipped_non_current_rows: u64,
+    sampler_ingested_rows: u64,
+    sampler_emitted_rows: u64,
+    writer_received_rows: u64,
+    writer_buffered_rows: u64,
+    writer_flush_errors: u64,
+    writer_recovered_drops: u64,
+    tokens_len: usize,
+    markets_len: usize,
+    last_backoff_ms: u64,
+    last_message_at: Option<String>,
 }
 
 struct Snapshot {
@@ -156,6 +176,26 @@ fn timeframe_rank_minutes(tf: &str) -> i64 {
         return n * 24 * 60;
     }
     i64::MAX / 2
+}
+
+fn build_clob_diag(state: &ClobUiState) -> ClobDiag {
+    ClobDiag {
+        reconnects: state.reconnects,
+        dropped_rows: state.dropped_rows,
+        enqueued_rows: state.enqueued_rows,
+        malformed_rows: state.malformed_rows,
+        skipped_non_current_rows: state.skipped_non_current_rows,
+        sampler_ingested_rows: state.sampler_ingested_rows,
+        sampler_emitted_rows: state.sampler_emitted_rows,
+        writer_received_rows: state.writer_received_rows,
+        writer_buffered_rows: state.writer_buffered_rows,
+        writer_flush_errors: state.writer_flush_errors,
+        writer_recovered_drops: state.writer_recovered_drops,
+        tokens_len: state.tokens.len(),
+        markets_len: state.markets.len(),
+        last_backoff_ms: state.last_backoff_ms,
+        last_message_at: state.last_message_at.map(|t| t.to_rfc3339()),
+    }
 }
 
 fn build_clob_market_rows(state: &ClobUiState) -> Vec<ClobMarketRow> {
@@ -254,6 +294,7 @@ async fn run_loop(
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     let mut page = Page::Oracle;
     let mut clob_rows_cache: Vec<ClobMarketRow> = Vec::new();
+    let mut clob_diag_cache: ClobDiag = ClobDiag::default();
     let mut clob_selected: usize = 0;
 
     loop {
@@ -277,11 +318,14 @@ async fn run_loop(
         let online = ws_online.load(Ordering::Relaxed);
         let clients = ws_clients.load(Ordering::Relaxed);
 
-        if matches!(page, Page::Clob) {
+        if matches!(page, Page::Clob | Page::Ingest) {
             let cs = clob_state.read().await;
-            clob_rows_cache = build_clob_market_rows(&cs);
-            if clob_selected >= clob_rows_cache.len() {
-                clob_selected = clob_rows_cache.len().saturating_sub(1);
+            clob_diag_cache = build_clob_diag(&cs);
+            if matches!(page, Page::Clob) {
+                clob_rows_cache = build_clob_market_rows(&cs);
+                if clob_selected >= clob_rows_cache.len() {
+                    clob_selected = clob_rows_cache.len().saturating_sub(1);
+                }
             }
         }
 
@@ -290,6 +334,7 @@ async fn run_loop(
                 f,
                 &snapshot,
                 &clob_rows_cache,
+                &clob_diag_cache,
                 clob_selected,
                 &log_lines,
                 &ws_addr,
@@ -310,11 +355,13 @@ async fn run_loop(
                     KeyCode::Tab => {
                         page = match page {
                             Page::Oracle => Page::Clob,
-                            Page::Clob => Page::Oracle,
+                            Page::Clob => Page::Ingest,
+                            Page::Ingest => Page::Oracle,
                         }
                     }
                     KeyCode::Char('1') => page = Page::Oracle,
                     KeyCode::Char('2') => page = Page::Clob,
+                    KeyCode::Char('3') => page = Page::Ingest,
                     KeyCode::Up if matches!(page, Page::Clob) => {
                         clob_selected = clob_selected.saturating_sub(1);
                     }
@@ -338,6 +385,7 @@ fn draw(
     f: &mut Frame,
     snap: &Snapshot,
     clob_rows: &[ClobMarketRow],
+    clob_diag: &ClobDiag,
     clob_selected: usize,
     log_lines: &[String],
     ws_addr: &str,
@@ -362,6 +410,7 @@ fn draw(
     match page {
         Page::Oracle => draw_prices(f, chunks[2], snap),
         Page::Clob => draw_clob_page(f, chunks[2], clob_rows, clob_selected),
+        Page::Ingest => draw_ingest_page(f, chunks[2], clob_diag),
     }
     draw_logs(f, chunks[3], log_lines);
 }
@@ -399,6 +448,7 @@ fn draw_server_status(
     let page_label = match page {
         Page::Oracle => "Page 1: Oracle",
         Page::Clob => "Page 2: CLOB/L2",
+        Page::Ingest => "Page 3: Ingest Health",
     };
 
     let spans = vec![
@@ -656,6 +706,42 @@ fn draw_clob_page(f: &mut Frame, area: Rect, rows: &[ClobMarketRow], selected: u
     ])
     .block(Block::default().title("Details (UP/DOWN)").borders(Borders::ALL));
     f.render_widget(detail, split[1]);
+}
+
+fn draw_ingest_page(f: &mut Frame, area: Rect, d: &ClobDiag) {
+    let block = Block::default()
+        .title(" CLOB Ingest Health (1/2/3 to switch) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let enq = d.enqueued_rows as f64;
+    let drop_pct = if enq > 0.0 { (d.dropped_rows as f64 * 100.0) / enq } else { 0.0 };
+    let emit_ratio = if d.sampler_ingested_rows > 0 {
+        d.sampler_emitted_rows as f64 / d.sampler_ingested_rows as f64
+    } else { 0.0 };
+
+    let p = Paragraph::new(vec![
+        Line::from(Span::styled("Live Counters", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(format!("tokens={}  markets={}  reconnects={}  last_backoff_ms={}", d.tokens_len, d.markets_len, d.reconnects, d.last_backoff_ms)),
+        Line::from(format!("last_message_at={}", d.last_message_at.clone().unwrap_or_else(|| "-".into()))),
+        Line::from(""),
+        Line::from(Span::styled("Sampling", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(format!("ingested={} emitted={} emit_ratio={:.3}", d.sampler_ingested_rows, d.sampler_emitted_rows, emit_ratio)),
+        Line::from(format!("skipped_non_current={} malformed_rows={}", d.skipped_non_current_rows, d.malformed_rows)),
+        Line::from(""),
+        Line::from(Span::styled("Queue / Writer", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+        Line::from(format!("enqueued={} dropped={} drop_pct={:.2}%", d.enqueued_rows, d.dropped_rows, drop_pct)),
+        Line::from(format!("writer_received={} writer_buffered={}", d.writer_received_rows, d.writer_buffered_rows)),
+        Line::from(format!("writer_flush_errors={} writer_recovered_drops={}", d.writer_flush_errors, d.writer_recovered_drops)),
+        Line::from(""),
+        Line::from(Span::styled("Hint", Style::default().fg(Color::DarkGray))),
+        Line::from("If drop_pct rises or writer_buffered keeps climbing, increase sampling interval or reduce persisted depth."),
+    ])
+    .block(Block::default().borders(Borders::NONE));
+
+    f.render_widget(p, inner);
 }
 
 fn draw_main_stats(f: &mut Frame, area: Rect, snap: &Snapshot) {

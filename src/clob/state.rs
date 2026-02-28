@@ -38,6 +38,14 @@ pub struct ClobUiState {
     pub reconnects: u64,
     pub dropped_rows: u64,
     pub enqueued_rows: u64,
+    pub malformed_rows: u64,
+    pub skipped_non_current_rows: u64,
+    pub sampler_ingested_rows: u64,
+    pub sampler_emitted_rows: u64,
+    pub writer_received_rows: u64,
+    pub writer_buffered_rows: u64,
+    pub writer_flush_errors: u64,
+    pub writer_recovered_drops: u64,
     pub last_backoff_ms: u64,
     pub last_message_at: Option<DateTime<Utc>>,
     pub tokens: HashMap<String, ClobTokenStats>, // key=token_id
@@ -56,6 +64,26 @@ impl ClobUiState {
 
     pub fn on_enqueue(&mut self) {
         self.enqueued_rows += 1;
+    }
+
+    pub fn on_malformed(&mut self) {
+        self.malformed_rows += 1;
+    }
+
+    pub fn on_skipped_non_current(&mut self) {
+        self.skipped_non_current_rows += 1;
+    }
+
+    pub fn set_sampler_stats(&mut self, ingested: u64, emitted: u64) {
+        self.sampler_ingested_rows = ingested;
+        self.sampler_emitted_rows = emitted;
+    }
+
+    pub fn set_writer_stats(&mut self, received: u64, buffered: u64, flush_errors: u64, recovered_drops: u64) {
+        self.writer_received_rows = received;
+        self.writer_buffered_rows = buffered;
+        self.writer_flush_errors = flush_errors;
+        self.writer_recovered_drops = recovered_drops;
     }
 
     pub fn set_market_meta(&mut self, token_id: String, condition_id: String, asset: String, timeframe: String, close_time: String, side: String) {

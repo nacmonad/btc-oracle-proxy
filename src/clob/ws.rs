@@ -28,6 +28,8 @@ struct L2Sampler {
     by_token: HashMap<String, TokenSampleSlot>,
     sample_interval_ms: i64,
     force_emit_ms: i64,
+    ingested_rows: u64,
+    emitted_rows: u64,
 }
 
 impl L2Sampler {
@@ -36,10 +38,13 @@ impl L2Sampler {
             by_token: HashMap::new(),
             sample_interval_ms: (cfg.clob_sample_interval_ms.max(1)) as i64,
             force_emit_ms: (cfg.clob_sample_force_emit_ms.max(1)) as i64,
+            ingested_rows: 0,
+            emitted_rows: 0,
         }
     }
 
     fn ingest(&mut self, row: SnapshotRow) {
+        self.ingested_rows += 1;
         let slot = self.by_token.entry(row.token_id.clone()).or_default();
         slot.latest = Some(row);
     }
@@ -62,6 +67,7 @@ impl L2Sampler {
             if should_emit {
                 slot.last_emitted = Some(latest.clone());
                 out.push(latest);
+                self.emitted_rows += 1;
             }
         }
 
@@ -281,6 +287,8 @@ pub async fn run_ws_first(writer: ClobWriter, cfg: Config, ui_state: Arc<RwLock<
 
                 let mut sample_tick = tokio::time::interval(Duration::from_millis(cfg.clob_sample_interval_ms.max(1)));
                 sample_tick.tick().await; // align on interval
+                let mut stats_tick = tokio::time::interval(Duration::from_secs(10));
+                stats_tick.tick().await;
 
                 loop {
                     tokio::select! {
@@ -302,6 +310,22 @@ pub async fn run_ws_first(writer: ClobWriter, cfg: Config, ui_state: Arc<RwLock<
                                     s.on_enqueue();
                                 }
                             }
+                            let mut s = ui_state.write().await;
+                            s.set_sampler_stats(sampler.ingested_rows, sampler.emitted_rows);
+                        }
+                        _ = stats_tick.tick() => {
+                            let s = ui_state.read().await;
+                            info!(
+                                ws_tokens=s.tokens.len(),
+                                ws_markets=s.markets.len(),
+                                ws_enqueued=s.enqueued_rows,
+                                ws_dropped=s.dropped_rows,
+                                ws_reconnects=s.reconnects,
+                                sampler_slots=sampler.by_token.len(),
+                                sampler_ingested=sampler.ingested_rows,
+                                sampler_emitted=sampler.emitted_rows,
+                                "clob ws stats"
+                            );
                         }
                         maybe = read.next() => {
                             let Some(msg) = maybe else { break; };
@@ -399,6 +423,8 @@ async fn handle_message(
         let bid_levels = parse_levels(bids);
         let ask_levels = parse_levels(asks);
         if bid_levels.is_empty() && ask_levels.is_empty() {
+            let mut s = ui_state.write().await;
+            s.on_malformed();
             continue;
         }
 
@@ -407,6 +433,8 @@ async fn handle_message(
         let best_ask = sane_opt(m.best_ask).filter(|v| sane_price(*v));
 
         if best_bid.is_none() && best_ask.is_none() {
+            let mut s = ui_state.write().await;
+            s.on_malformed();
             continue;
         }
 
@@ -452,6 +480,9 @@ async fn handle_message(
 
         if should_persist_market_now(&timeframe, &close_time, Utc::now()) {
             sampler.ingest(row);
+        } else {
+            let mut s = ui_state.write().await;
+            s.on_skipped_non_current();
         }
     }
 
