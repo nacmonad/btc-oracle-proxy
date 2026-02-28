@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use duckdb::{params, Connection};
 use std::path::Path;
 use std::sync::Arc;
@@ -81,6 +81,11 @@ fn open_db() -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+fn ts_sql(ts: &DateTime<Utc>) -> String {
+    // DuckDB TIMESTAMPTZ parsing is most reliable with microsecond precision.
+    ts.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
 fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
@@ -126,7 +131,7 @@ fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>) -> anyhow::Re
 
         for r in rows.iter() {
             snap_stmt.execute(params![
-                r.ts.to_rfc3339(),
+                ts_sql(&r.ts),
                 r.condition_id,
                 r.token_id,
                 r.best_bid,
@@ -156,7 +161,7 @@ fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>) -> anyhow::Re
             for (idx, lvl) in r.bid_levels.iter().enumerate() {
                 cumulative += lvl.size;
                 lvl_stmt.execute(params![
-                    r.ts.to_rfc3339(),
+                    ts_sql(&r.ts),
                     r.condition_id,
                     r.token_id,
                     "BID",
@@ -173,7 +178,7 @@ fn flush_batch(conn: &mut Connection, rows: &mut Vec<SnapshotRow>) -> anyhow::Re
             for (idx, lvl) in r.ask_levels.iter().enumerate() {
                 cumulative += lvl.size;
                 lvl_stmt.execute(params![
-                    r.ts.to_rfc3339(),
+                    ts_sql(&r.ts),
                     r.condition_id,
                     r.token_id,
                     "ASK",

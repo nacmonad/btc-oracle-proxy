@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use duckdb::{params, Connection};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use tokio::sync::RwLock;
@@ -16,6 +17,26 @@ use crate::clob::writer::{ClobWriter, DepthLevel, SnapshotRow};
 use crate::config::Config;
 
 type TokenRec = (String, String, String, String, String, String); // (condition_id, token_id, asset, timeframe, close_time, side)
+
+#[derive(Debug, Clone)]
+struct MarketRec {
+    condition_id: String,
+    question: String,
+    asset: String,
+    timeframe: String,
+    close_time: String,
+    outcome: Option<String>,
+    winning_price: Option<f64>,
+    resolved_at: Option<String>,
+    token_yes_id: String,
+    token_no_id: String,
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryBatch {
+    tokens: Vec<TokenRec>,
+    markets: Vec<MarketRec>,
+}
 
 #[derive(Debug, Default, Clone)]
 struct TokenSampleSlot {
@@ -65,8 +86,13 @@ impl L2Sampler {
             };
 
             if should_emit {
-                slot.last_emitted = Some(latest.clone());
-                out.push(latest);
+                let mut emitted = latest.clone();
+                // IMPORTANT: each persisted snapshot must get a fresh ingest timestamp.
+                // Re-emitting an unchanged cached row with the original ts can violate
+                // pm_snapshots primary key (ts, token_id).
+                emitted.ts = now;
+                slot.last_emitted = Some(emitted.clone());
+                out.push(emitted);
                 self.emitted_rows += 1;
             }
         }
@@ -177,9 +203,115 @@ fn extract_tokens(m: &serde_json::Value) -> Option<(String, String)> {
     None
 }
 
-async fn load_active_tokens(cfg: &Config) -> anyhow::Result<Vec<TokenRec>> {
+fn parse_market_outcome(m: &serde_json::Value) -> (Option<String>, Option<f64>, Option<String>) {
+    let closed = m.get("closed").and_then(|x| x.as_bool()).unwrap_or(false);
+    let mut outcome: Option<String> = None;
+
+    if closed {
+        let outcomes_raw = m.get("outcomes").cloned().unwrap_or(serde_json::Value::Null);
+        let prices_raw = m.get("outcomePrices").cloned().unwrap_or(serde_json::Value::Null);
+
+        let outcomes: Vec<String> = if let Some(s) = outcomes_raw.as_str() {
+            serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
+        } else {
+            outcomes_raw.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default()
+        };
+        let prices: Vec<f64> = if let Some(s) = prices_raw.as_str() {
+            serde_json::from_str::<Vec<String>>(s)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|x| x.parse::<f64>().ok())
+                .collect()
+        } else {
+            prices_raw.as_array().map(|a| a.iter().filter_map(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64())).collect()).unwrap_or_default()
+        };
+
+        for (name, p) in outcomes.into_iter().zip(prices.into_iter()) {
+            if (p - 1.0).abs() < 1e-9 {
+                let u = name.to_ascii_uppercase();
+                outcome = Some(if u.contains("UP") || u.contains("YES") { "YES".to_string() } else { "NO".to_string() });
+                break;
+            }
+        }
+    }
+
+    if outcome.is_none() {
+        if let Some(raw) = m.get("outcome").and_then(|x| x.as_str()) {
+            let u = raw.to_ascii_uppercase();
+            if u == "UP" || u == "YES" {
+                outcome = Some("YES".to_string());
+            } else if u == "DOWN" || u == "NO" {
+                outcome = Some("NO".to_string());
+            }
+        }
+    }
+
+    let winning_price = m
+        .get("winningPrice")
+        .or_else(|| m.get("winning_price"))
+        .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse::<f64>().ok())));
+
+    let resolved_at = if outcome.is_some() {
+        m.get("resolvedAt")
+            .or_else(|| m.get("resolved_at"))
+            .or_else(|| m.get("updatedAt"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    (outcome, winning_price, resolved_at)
+}
+
+fn upsert_markets_db(markets: &[MarketRec]) -> anyhow::Result<()> {
+    if markets.is_empty() {
+        return Ok(());
+    }
+    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "../data/researcher.db".to_string());
+    let mut conn = Connection::open(&db_path)?;
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(r#"
+            INSERT INTO pm_markets
+                (condition_id, question, asset, timeframe, direction, close_time, resolved_at, outcome, winning_price, token_yes_id, token_no_id, last_updated)
+            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, now())
+            ON CONFLICT(condition_id) DO UPDATE SET
+                question = excluded.question,
+                asset = excluded.asset,
+                timeframe = excluded.timeframe,
+                close_time = excluded.close_time,
+                resolved_at = COALESCE(excluded.resolved_at, pm_markets.resolved_at),
+                outcome = COALESCE(excluded.outcome, pm_markets.outcome),
+                winning_price = COALESCE(excluded.winning_price, pm_markets.winning_price),
+                token_yes_id = excluded.token_yes_id,
+                token_no_id = excluded.token_no_id,
+                last_updated = now()
+        "#)?;
+
+        for m in markets {
+            stmt.execute(params![
+                m.condition_id,
+                m.question,
+                m.asset,
+                m.timeframe,
+                m.close_time,
+                m.resolved_at,
+                m.outcome,
+                m.winning_price,
+                m.token_yes_id,
+                m.token_no_id,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+async fn load_active_tokens(cfg: &Config) -> anyhow::Result<DiscoveryBatch> {
     let client = Client::builder().timeout(Duration::from_secs(8)).build()?;
     let mut out: Vec<TokenRec> = Vec::new();
+    let mut markets: Vec<MarketRec> = Vec::new();
 
     for asset in &cfg.clob_assets {
         for tf in &cfg.clob_timeframes {
@@ -227,6 +359,27 @@ async fn load_active_tokens(cfg: &Config) -> anyhow::Result<Vec<TokenRec>> {
                         .to_string();
 
                     let Some((yes, no)) = extract_tokens(&m) else { continue };
+                    let question = m
+                        .get("question")
+                        .or_else(|| m.get("title"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let (outcome, winning_price, resolved_at) = parse_market_outcome(&m);
+
+                    markets.push(MarketRec {
+                        condition_id: cid.clone(),
+                        question,
+                        asset: asset.clone(),
+                        timeframe: tf.clone(),
+                        close_time: close_time.clone(),
+                        outcome,
+                        winning_price,
+                        resolved_at,
+                        token_yes_id: yes.clone(),
+                        token_no_id: no.clone(),
+                    });
+
                     out.push((cid.clone(), yes, asset.clone(), tf.clone(), close_time.clone(), "UP".to_string()));
                     out.push((cid, no, asset.clone(), tf.clone(), close_time, "DOWN".to_string()));
                 }
@@ -235,26 +388,41 @@ async fn load_active_tokens(cfg: &Config) -> anyhow::Result<Vec<TokenRec>> {
     }
 
     // de-dupe token ids
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     out.retain(|(_, token, _, _, _, _)| seen.insert(token.clone()));
 
-    Ok(out)
+    // de-dupe markets by condition_id (keep latest seen)
+    let mut by_condition: HashMap<String, MarketRec> = HashMap::new();
+    for m in markets {
+        by_condition.insert(m.condition_id.clone(), m);
+    }
+
+    Ok(DiscoveryBatch {
+        tokens: out,
+        markets: by_condition.into_values().collect(),
+    })
 }
 
 pub async fn run_ws_first(writer: ClobWriter, cfg: Config, ui_state: Arc<RwLock<ClobUiState>>) -> anyhow::Result<()> {
     let mut backoff = cfg.clob_initial_backoff_ms.max(100);
 
     loop {
-        let tokens = match load_active_tokens(&cfg).await {
-            Ok(t) => {
-                info!(loaded_tokens=t.len(), "load_active_tokens ok (slug-based)");
-                t
+        let discovery = match load_active_tokens(&cfg).await {
+            Ok(d) => {
+                info!(loaded_tokens=d.tokens.len(), loaded_markets=d.markets.len(), "load_active_tokens ok (slug-based)");
+                d
             }
             Err(e) => {
                 warn!("load_active_tokens failed: {:#}", e);
-                Vec::new()
+                DiscoveryBatch::default()
             }
         };
+
+        if let Err(e) = upsert_markets_db(&discovery.markets) {
+            warn!(error=%e, "failed to upsert discovered markets into pm_markets");
+        }
+
+        let tokens = discovery.tokens;
 
         if tokens.is_empty() {
             warn!("no active CLOB tokens found via slug discovery; retrying");
