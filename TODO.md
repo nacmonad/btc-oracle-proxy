@@ -728,16 +728,18 @@ GET /health
 - Python should no longer be required in the live execution loop.
 
 ### Dependency
-- [ ] Integrate `rs-clob-client`: https://github.com/Polymarket/rs-clob-client
-- [ ] Pin crate revision/tag and document compatibility in `Cargo.toml`.
+- [x] Integrate CLOB live ingestion path in Rust (`src/clob/ws.rs` + writer queue).
+- [ ] Optional future: switch token discovery/subscription to official `rs-clob-client` crate.
+- [ ] Pin crate revision/tag and document compatibility in `Cargo.toml` (if/when switched).
 - [ ] Add integration tests to validate API responses and WS reconnection behavior.
 
 ### Rust Modules (new)
-- [ ] `src/clob/mod.rs`
-- [ ] `src/clob/client.rs` — wraps rs-clob-client REST/WS usage
-- [ ] `src/clob/book_cache.rs` — in-memory order book state per token
-- [ ] `src/clob/metrics.rs` — L1 + L2 derived metrics
-- [ ] `src/clob/writer.rs` — async DB write queue to DuckDB (batch insert)
+- [x] `src/clob/mod.rs`
+- [~] `src/clob/client.rs` — placeholder models exist; full rs-clob-client wrapper still pending
+- [x] `src/clob/state.rs` — in-memory order book/token UI state per token
+- [x] `src/clob/metrics.rs` — L1 + L2 derived metrics
+- [x] `src/clob/writer.rs` — async DB write queue to DuckDB (batch insert)
+- [x] `src/clob/ws.rs` — WS-first ingest + sampling + market refresh + DB write gating
 
 ### Data Flow (Rust hot path)
 1. Subscribe to active token IDs for target markets.
@@ -748,17 +750,21 @@ GET /health
 4. Batch-write snapshots to `researcher.db` on an interval (non-blocking writer task).
 
 ### DuckDB Integration
-- [ ] Use one dedicated writer task/thread for DB IO (bounded mpsc queue).
-- [ ] Never block WS ingestion on DB writes.
-- [ ] Batch inserts every 250-500ms (configurable) or every N updates.
-- [ ] Add drop/backpressure policy when queue is full (log + metric).
-- [ ] Use shared DB path: `../data/researcher.db` (repo root `Polymarket/data/`).
+- [x] Use one dedicated writer task/thread for DB IO (bounded mpsc queue).
+- [x] Never block WS ingestion on DB writes.
+- [x] Batch inserts on configurable interval (`CLOB_WRITER_FLUSH_MS`) or queue-size trigger.
+- [x] Add drop/backpressure policy when queue is full (log + UI counters).
+- [x] Use shared DB path: `../data/researcher.db` (repo root `Polymarket/data/`).
+- [x] Added WS-side sampler (`CLOB_SAMPLE_INTERVAL_MS`, `CLOB_SAMPLE_FORCE_EMIT_MS`) to reduce write amplification.
+- [x] Added malformed payload filtering before enqueue (finite checks + price/size sanity bounds).
+- [x] Added active-window write gate: persist only current 5m/15m markets; keep 1h lookahead in-memory.
 
 ### Schema Tasks (researcher DB)
-- [ ] Extend `pm_snapshots` with L2-derived aggregate columns.
-- [ ] Optional: add `pm_order_book_levels` for periodic full depth archival.
-- [ ] Add `source` field (`live_rust`, `backfill_cli`, `legacy_python`) for lineage.
-- [ ] Add indexes for `(token_id, ts)` and `(condition_id, ts)` if missing.
+- [x] `pm_snapshots` includes L2-derived aggregate columns in live writes.
+- [x] `pm_order_book_levels` currently enabled for full-depth archival.
+- [x] `source` field populated (`live_rust`) for lineage.
+- [ ] Add/verify indexes for `(token_id, ts)` and `(condition_id, ts)` if missing.
+- [ ] Decide whether to keep full `pm_order_book_levels` always-on or sampled/periodic only.
 
 ### Backfill Strategy (important)
 - Historical CLI endpoint provides **1-minute price series**, not full historical L2 book depth.
@@ -773,15 +779,31 @@ GET /health
 - [ ] Metrics: messages/sec, dropped updates, queue lag, snapshot writes/sec, 429/error counts.
 
 ### Migration Plan
-- [ ] Phase A: Run Rust collector in shadow mode; keep Python collector as reference.
-- [ ] Phase B: Compare row counts/quality (L1 parity + L2 metric sanity checks).
-- [ ] Phase C: Switch primary writes to Rust; disable Python collector in live stack.
-- [ ] Phase D: Keep Python paths for offline backtesting + model experiments only.
+- [x] Phase A: Run Rust collector in shadow mode; keep Python collector as reference.
+- [x] Phase B: Compare row counts/quality and growth behavior; identify redundancy profile.
+- [x] Phase C: Switch primary writes to Rust; Python no longer required in live path.
+- [~] Phase D: Keep Python paths for offline backtesting + model experiments only (cleanup/documentation still pending).
 
 ### Deliverables
-- [ ] Rust CLOB collector running in production with DB writes.
-- [ ] Updated docs describing decoupled architecture.
+- [x] Rust CLOB collector running in production with DB writes.
+- [~] Updated docs describing decoupled architecture (core docs updated, final pass pending).
 - [ ] Validation report: Rust vs Python collector parity window (24-72h).
+
+### 2026-02-28 Progress Snapshot
+- Implemented WS-first CLOB ingest with slug-based market discovery (Gamma API), periodic refresh, and in-memory TUI state.
+- Added DB write sampling (`CLOB_SAMPLE_INTERVAL_MS`, `CLOB_SAMPLE_FORCE_EMIT_MS`) so flush cadence no longer implies raw event write rate.
+- Added active-window persistence gating: only current 5m/15m periods are persisted; 1h lookahead is still watched in-memory.
+- Added malformed row filtering before enqueue (finite + bounded price/size checks) and writer recovery behavior for repeated flush failures.
+- Performed one-time historical prune of redundant same-topbook rows:
+  - deleted snapshots: 30,171
+  - deleted order-book levels: 2,928,798
+
+### Remaining Work (besides observing runtime for 48h)
+1. Add writer/ingest observability in logs/TUI (rows/sec, levels/sec, malformed/skipped counters).
+2. Confirm `pm_markets` metadata joins (timeframe/close_time) are fully populated for post-hoc analytics.
+3. Decide long-term retention policy for `pm_order_book_levels` (always-on vs periodic/sample-only).
+4. Add/verify DB indexes and run query-latency sanity checks after sustained ingest.
+5. Produce short validation report (growth rate, redundancy ratio, and signal quality vs prior baseline).
 
 ---
 

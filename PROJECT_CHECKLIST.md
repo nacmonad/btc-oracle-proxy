@@ -1,5 +1,15 @@
 # OracleProxy Project Completion Checklist
 
+> ## 2026-02-28 Live Progress Update (supersedes older scaffold-only status)
+> - ✅ Rust CLOB live ingestion is running (`src/clob/ws.rs` + `src/clob/writer.rs`).
+> - ✅ Sampling + active-window DB gating are implemented to control write volume.
+> - ✅ Historical redundant-row prune executed successfully.
+> - ✅ Malformed payload filtering added before DB enqueue.
+> - ⏳ Remaining: observability counters in TUI/logs, retention/index tuning, and 48-72h validation report.
+>
+> This file still contains historical scaffold milestones below; use TODO.md Phase 6 section for current execution status.
+
+
 ## ✅ COMPLETED DELIVERABLES
 
 ### Phase 0: Research & Architecture (100%)
