@@ -67,6 +67,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }));
 
+        clob_tasks.push(tokio::spawn(async move {
+            clob::outcome_local::run_local_outcome_loop(30_000).await;
+        }));
+
         info!("CLOB WS-first ingestion enabled");
     }
 

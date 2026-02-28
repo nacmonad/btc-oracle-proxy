@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod writer;
 pub mod ws;
 pub mod state;
+pub mod outcome_local;
 
 pub use client::BookLevel;
 pub use writer::ClobWriter;
