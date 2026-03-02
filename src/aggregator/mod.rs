@@ -7,11 +7,12 @@ pub mod exchange_client;
 use crate::config::Config;
 use crate::error::OracleResult;
 use crate::indicators::{self, IndicatorConfig};
+use crate::clob::state::ClobUiState;
 use crate::clob::writer::ClobWriter;
 use crate::models::{
     AppState, BbBreakoutEvent, DeviationApproachEvent, ExchangePrice, ExchangeStatus,
-    PreTriggerAlertEvent, PriceUpdate, RoundDirection, RoundSettledEvent, RoundTriggeredEvent,
-    WsEvent,
+    MarketContext, PreTriggerAlertEvent, PriceUpdate, RoundDirection, RoundSettledEvent,
+    RoundTriggeredEvent, WsEvent,
 };
 use chrono::Utc;
 use std::collections::HashMap;
@@ -30,6 +31,7 @@ use tracing::{info, warn};
 /// 5. Writes a fully enriched `PriceUpdate` to state
 pub async fn run_aggregator(
     state: Arc<RwLock<AppState>>,
+    clob_ui_state: Arc<RwLock<ClobUiState>>,
     config: Config,
     event_tx: broadcast::Sender<WsEvent>,
     db_writer: ClobWriter,
@@ -148,9 +150,51 @@ pub async fn run_aggregator(
                 let exchange_prices: HashMap<String, f64> =
                     fresh.iter().map(|p| (p.exchange.clone(), p.price)).collect();
 
+                let market_context = {
+                    let clob = clob_ui_state.read().await;
+                    clob.latest_round_quote("BTC", "15m").map(|rq| {
+                        let age_up = now.signed_duration_since(rq.up.updated_at).num_milliseconds();
+                        let age_down = now.signed_duration_since(rq.down.updated_at).num_milliseconds();
+                        let book_age_ms = Some(age_up.max(age_down).max(0));
+                        MarketContext {
+                            condition_id: rq.condition_id,
+                            token_yes_id: rq.up.token_id,
+                            token_no_id: rq.down.token_id,
+                            up_bid: rq.up.best_bid,
+                            up_ask: rq.up.best_ask,
+                            down_bid: rq.down.best_bid,
+                            down_ask: rq.down.best_ask,
+                            up_spread: rq.up.spread,
+                            down_spread: rq.down.spread,
+                            round_close_ts: rq.close_time,
+                            book_age_ms,
+                        }
+                    })
+                };
+
+                let condition_id = market_context.as_ref().map(|m| m.condition_id.clone());
+                let token_yes_id = market_context.as_ref().map(|m| m.token_yes_id.clone());
+                let token_no_id = market_context.as_ref().map(|m| m.token_no_id.clone());
+                let up_bid = market_context.as_ref().and_then(|m| m.up_bid);
+                let up_ask = market_context.as_ref().and_then(|m| m.up_ask);
+                let down_bid = market_context.as_ref().and_then(|m| m.down_bid);
+                let down_ask = market_context.as_ref().and_then(|m| m.down_ask);
+                let round_close_ts = market_context.as_ref().and_then(|m| m.round_close_ts.clone());
+                let book_age_ms = market_context.as_ref().and_then(|m| m.book_age_ms);
+
                 s.current_price = Some(PriceUpdate {
                     timestamp: now,
                     symbol: "BTC/USD".to_string(),
+                    market_context,
+                    condition_id,
+                    token_yes_id,
+                    token_no_id,
+                    up_bid,
+                    up_ask,
+                    down_bid,
+                    down_ask,
+                    round_close_ts,
+                    book_age_ms,
                     market_price,
                     chainlink_price,
                     chainlink_age_secs,

@@ -4,6 +4,23 @@ use chrono::{DateTime, Utc};
 
 use crate::clob::writer::SnapshotRow;
 
+#[derive(Debug, Clone)]
+pub struct SideQuote {
+    pub token_id: String,
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+    pub spread: Option<f64>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoundQuote {
+    pub condition_id: String,
+    pub close_time: Option<String>,
+    pub up: SideQuote,
+    pub down: SideQuote,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ClobTokenStats {
     pub condition_id: String,
@@ -51,6 +68,19 @@ pub struct ClobUiState {
     pub last_message_at: Option<DateTime<Utc>>,
     pub tokens: HashMap<String, ClobTokenStats>, // key=token_id
     pub markets: HashMap<String, MarketMeta>,     // key=token_id
+}
+
+fn parse_close_time_to_utc(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z") {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(chrono::DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+    }
+    None
 }
 
 impl ClobUiState {
@@ -114,4 +144,70 @@ impl ClobUiState {
             },
         );
     }
+
+    pub fn latest_round_quote(&self, asset: &str, preferred_timeframe: &str) -> Option<RoundQuote> {
+        let now = Utc::now();
+
+        let mut candidates: HashMap<String, (Option<DateTime<Utc>>, Option<String>, Option<String>, Option<String>)> = HashMap::new();
+        for m in self.markets.values() {
+            if !m.asset.eq_ignore_ascii_case(asset) {
+                continue;
+            }
+            // Strict timeframe match to avoid leaking 5m IDs into 15m strategy flow.
+            if m.timeframe != preferred_timeframe {
+                continue;
+            }
+            let entry = candidates
+                .entry(m.condition_id.clone())
+                .or_insert((parse_close_time_to_utc(&m.close_time), Some(m.close_time.clone()), None, None));
+
+            if m.side.eq_ignore_ascii_case("UP") {
+                entry.2 = Some(m.token_id.clone());
+            } else if m.side.eq_ignore_ascii_case("DOWN") {
+                entry.3 = Some(m.token_id.clone());
+            }
+        }
+
+        let mut picked: Option<(String, Option<DateTime<Utc>>, Option<String>, String, String)> = None;
+        for (cid, (close_dt, close_raw, up, down)) in candidates {
+            let (Some(up_id), Some(down_id)) = (up, down) else { continue };
+            let score = close_dt.map(|dt| dt.signed_duration_since(now).num_seconds()).unwrap_or(i64::MAX);
+            if score < 0 {
+                continue;
+            }
+            match &picked {
+                None => picked = Some((cid, close_dt, close_raw, up_id, down_id)),
+                Some((_, best_dt, _, _, _)) => {
+                    let best_score = best_dt.map(|dt| dt.signed_duration_since(now).num_seconds()).unwrap_or(i64::MAX);
+                    if score < best_score {
+                        picked = Some((cid, close_dt, close_raw, up_id, down_id));
+                    }
+                }
+            }
+        }
+
+        let (condition_id, _close_dt, close_raw, up_id, down_id) = picked?;
+        let up = self.tokens.get(&up_id)?;
+        let down = self.tokens.get(&down_id)?;
+
+        Some(RoundQuote {
+            condition_id,
+            close_time: close_raw,
+            up: SideQuote {
+                token_id: up_id,
+                best_bid: up.best_bid,
+                best_ask: up.best_ask,
+                spread: up.spread,
+                updated_at: up.updated_at,
+            },
+            down: SideQuote {
+                token_id: down_id,
+                best_bid: down.best_bid,
+                best_ask: down.best_ask,
+                spread: down.spread,
+                updated_at: down.updated_at,
+            },
+        })
+    }
 }
+

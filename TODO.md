@@ -414,6 +414,10 @@ async def oracle_consumer():
 
 ### Phase 3: Production Hardening
 - [ ] HTTP REST API (health, price, indicators)
+- [ ] Localhost execution signer API for Python executor offload
+  - Spec draft: `src/http_api/execution_signer_api.md`
+  - Endpoints: `/execution/health`, `/execution/order`, `/execution/cancel`, `/execution/order_status`
+  - Measure localhost roundtrip overhead vs Python `py-clob-client` path
 - [ ] Prometheus metrics + structured logging
 - [ ] Reconnection logic + stale-feed circuit breakers
 - [ ] Load testing
@@ -804,6 +808,7 @@ GET /health
 3. Decide long-term retention policy for `pm_order_book_levels` (always-on vs periodic/sample-only).
 4. Add/verify DB indexes and run query-latency sanity checks after sustained ingest.
 5. Produce short validation report (growth rate, redundancy ratio, and signal quality vs prior baseline).
+6. Evaluate transport choice for executor handoff: direct WS tick stream vs shared Redis cache/pubsub (measure p50/p95 latency, jitter, drop behavior, and failover characteristics).
 
 ---
 

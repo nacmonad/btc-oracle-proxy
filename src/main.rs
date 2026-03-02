@@ -69,8 +69,9 @@ async fn main() -> anyhow::Result<()> {
     let cfg_agg = config.clone();
     let tx_agg = event_tx.clone();
     let db_writer_agg = db_writer.clone();
+    let clob_ui_state_agg = clob_ui_state.clone();
     let aggregator_task = tokio::spawn(async move {
-        if let Err(e) = aggregator::run_aggregator(state_agg, cfg_agg, tx_agg, db_writer_agg).await {
+        if let Err(e) = aggregator::run_aggregator(state_agg, clob_ui_state_agg, cfg_agg, tx_agg, db_writer_agg).await {
             log_error!("Aggregator error: {}", e);
         }
     });

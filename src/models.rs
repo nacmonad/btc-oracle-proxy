@@ -39,6 +39,28 @@ pub struct PriceUpdate {
     pub timestamp: DateTime<Utc>,
     pub symbol: String,
 
+    /// Polymarket round/book context for execution bots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_context: Option<MarketContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_yes_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_no_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_bid: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_ask: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub down_bid: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub down_ask: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round_close_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_age_ms: Option<i64>,
+
     /// Median-aggregated market price from exchange feeds.
     pub market_price: f64,
 
@@ -58,6 +80,30 @@ pub struct PriceUpdate {
     pub exchange_prices: HashMap<String, f64>,
 
     pub indicators: IndicatorValues,
+}
+
+/// Technical indicators calculated on the rolling price history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketContext {
+    pub condition_id: String,
+    pub token_yes_id: String,
+    pub token_no_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_bid: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_ask: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub down_bid: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub down_ask: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_spread: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub down_spread: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round_close_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_age_ms: Option<i64>,
 }
 
 /// Technical indicators calculated on the rolling price history.
