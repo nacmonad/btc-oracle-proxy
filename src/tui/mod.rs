@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use crossterm::{
@@ -89,6 +89,13 @@ struct ClobDiag {
     markets_len: usize,
     last_backoff_ms: u64,
     last_message_at: Option<String>,
+    sampler_ingested_fps: f64,
+    sampler_emitted_fps: f64,
+    writer_received_fps: f64,
+    enqueued_fps: f64,
+    dropped_fps: f64,
+    exchange_update_fps: Vec<(String, f64)>,
+    market_frame_fps: f64,
 }
 
 struct Snapshot {
@@ -196,6 +203,13 @@ fn build_clob_diag(state: &ClobUiState) -> ClobDiag {
         markets_len: state.markets.len(),
         last_backoff_ms: state.last_backoff_ms,
         last_message_at: state.last_message_at.map(|t| t.to_rfc3339()),
+        sampler_ingested_fps: 0.0,
+        sampler_emitted_fps: 0.0,
+        writer_received_fps: 0.0,
+        enqueued_fps: 0.0,
+        dropped_fps: 0.0,
+        exchange_update_fps: Vec::new(),
+        market_frame_fps: 0.0,
     }
 }
 
@@ -302,6 +316,17 @@ async fn run_loop(
     let mut clob_rows_cache: Vec<ClobMarketRow> = Vec::new();
     let mut clob_diag_cache: ClobDiag = ClobDiag::default();
     let mut clob_selected: usize = 0;
+    let mut last_rate_at = Instant::now();
+    let mut prev_enqueued_rows: u64 = 0;
+    let mut prev_dropped_rows: u64 = 0;
+    let mut prev_sampler_ingested_rows: u64 = 0;
+    let mut prev_sampler_emitted_rows: u64 = 0;
+    let mut prev_writer_received_rows: u64 = 0;
+    let mut prev_exchange_age_ms: HashMap<String, Option<i64>> = HashMap::new();
+    let mut exchange_update_counts: HashMap<String, u64> = HashMap::new();
+    let mut display_exchange_fps: HashMap<String, f64> = HashMap::new();
+    let mut prev_last_update: Option<DateTime<Utc>> = None;
+    let mut market_frame_count: u64 = 0;
 
     loop {
         ticker.tick().await;
@@ -310,6 +335,22 @@ async fn run_loop(
             let s = state.read().await;
             Snapshot::from_state(&s)
         };
+
+        if snapshot.last_update != prev_last_update {
+            market_frame_count += 1;
+            prev_last_update = snapshot.last_update;
+        }
+
+        for (name, _connected, age_ms) in &snapshot.exchange_statuses {
+            let prev = prev_exchange_age_ms.get(name).cloned().unwrap_or(None);
+            // age drops when a fresh exchange tick arrived
+            if let (Some(p), Some(c)) = (prev, *age_ms) {
+                if c < p {
+                    *exchange_update_counts.entry(name.clone()).or_insert(0) += 1;
+                }
+            }
+            prev_exchange_age_ms.insert(name.clone(), *age_ms);
+        }
 
         let log_lines: Vec<String> = {
             logs.lock()
@@ -326,7 +367,57 @@ async fn run_loop(
 
         if matches!(page, Page::Clob | Page::Ingest) {
             let cs = clob_state.read().await;
-            clob_diag_cache = build_clob_diag(&cs);
+            let mut next_diag = build_clob_diag(&cs);
+            // Preserve computed rate metrics between refreshes to avoid UI flicker.
+            next_diag.sampler_ingested_fps = clob_diag_cache.sampler_ingested_fps;
+            next_diag.sampler_emitted_fps = clob_diag_cache.sampler_emitted_fps;
+            next_diag.writer_received_fps = clob_diag_cache.writer_received_fps;
+            next_diag.enqueued_fps = clob_diag_cache.enqueued_fps;
+            next_diag.dropped_fps = clob_diag_cache.dropped_fps;
+            next_diag.exchange_update_fps = clob_diag_cache.exchange_update_fps.clone();
+            next_diag.market_frame_fps = clob_diag_cache.market_frame_fps;
+            clob_diag_cache = next_diag;
+
+            let dt = last_rate_at.elapsed().as_secs_f64();
+            if dt >= 0.5 {
+                let enq_delta = clob_diag_cache.enqueued_rows.saturating_sub(prev_enqueued_rows);
+                let drop_delta = clob_diag_cache.dropped_rows.saturating_sub(prev_dropped_rows);
+                let ing_delta = clob_diag_cache.sampler_ingested_rows.saturating_sub(prev_sampler_ingested_rows);
+                let em_delta = clob_diag_cache.sampler_emitted_rows.saturating_sub(prev_sampler_emitted_rows);
+                let wr_delta = clob_diag_cache.writer_received_rows.saturating_sub(prev_writer_received_rows);
+
+                clob_diag_cache.enqueued_fps = enq_delta as f64 / dt;
+                clob_diag_cache.dropped_fps = drop_delta as f64 / dt;
+                clob_diag_cache.sampler_ingested_fps = ing_delta as f64 / dt;
+                clob_diag_cache.sampler_emitted_fps = em_delta as f64 / dt;
+                clob_diag_cache.writer_received_fps = wr_delta as f64 / dt;
+
+                for (k, v) in exchange_update_counts.iter() {
+                    let inst = (*v as f64) / dt;
+                    let prev = *display_exchange_fps.get(k).unwrap_or(&inst);
+                    // EMA smoothing to avoid flicker: keep 70% prior, 30% new sample.
+                    let smoothed = (0.7 * prev) + (0.3 * inst);
+                    display_exchange_fps.insert(k.clone(), smoothed);
+                }
+
+                let mut ex_rates: Vec<(String, f64)> = display_exchange_fps
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                ex_rates.sort_by(|a,b| a.0.cmp(&b.0));
+                clob_diag_cache.exchange_update_fps = ex_rates;
+                clob_diag_cache.market_frame_fps = (market_frame_count as f64) / dt;
+                exchange_update_counts.clear();
+                market_frame_count = 0;
+
+                prev_enqueued_rows = clob_diag_cache.enqueued_rows;
+                prev_dropped_rows = clob_diag_cache.dropped_rows;
+                prev_sampler_ingested_rows = clob_diag_cache.sampler_ingested_rows;
+                prev_sampler_emitted_rows = clob_diag_cache.sampler_emitted_rows;
+                prev_writer_received_rows = clob_diag_cache.writer_received_rows;
+                last_rate_at = Instant::now();
+            }
+
             if matches!(page, Page::Clob) {
                 clob_rows_cache = build_clob_market_rows(&cs);
                 if clob_selected >= clob_rows_cache.len() {
@@ -757,11 +848,24 @@ fn draw_ingest_page(f: &mut Frame, area: Rect, d: &ClobDiag) {
         Line::from(""),
         Line::from(Span::styled("Sampling", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(format!("ingested={} emitted={} emit_ratio={:.3}", d.sampler_ingested_rows, d.sampler_emitted_rows, emit_ratio)),
+        Line::from(format!("ingested_fps={:.2} emitted_fps={:.2}", d.sampler_ingested_fps, d.sampler_emitted_fps)),
         Line::from(format!("skipped_non_current={} malformed_rows={}", d.skipped_non_current_rows, d.malformed_rows)),
+        Line::from(""),
+        Line::from(Span::styled(format!("Effective market_frame_fps={:.2}", d.market_frame_fps), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("Exchange updates (approx fps)", Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD))),
+        Line::from(
+            d.exchange_update_fps
+                .iter()
+                .map(|(n,fps)| format!("{}={:.2}", n, fps))
+                .collect::<Vec<_>>()
+                .join("  ")
+        ),
         Line::from(""),
         Line::from(Span::styled("Queue / Writer", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
         Line::from(format!("enqueued={} dropped={} drop_pct={:.2}%", d.enqueued_rows, d.dropped_rows, drop_pct)),
+        Line::from(format!("enqueued_fps={:.2} dropped_fps={:.2}", d.enqueued_fps, d.dropped_fps)),
         Line::from(format!("writer_received={} writer_buffered={}", d.writer_received_rows, d.writer_buffered_rows)),
+        Line::from(format!("writer_received_fps={:.2}", d.writer_received_fps)),
         Line::from(format!("writer_flush_errors={} writer_recovered_drops={}", d.writer_flush_errors, d.writer_recovered_drops)),
         Line::from(""),
         Line::from(Span::styled("Hint", Style::default().fg(Color::DarkGray))),

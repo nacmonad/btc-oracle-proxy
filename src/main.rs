@@ -79,11 +79,13 @@ async fn main() -> anyhow::Result<()> {
     // ── WebSocket server ──────────────────────────────────────────────────────
     let ws_addr = config.ws_listen_addr.clone();
     let state_ws = state.clone();
+    let clob_ui_state_ws_srv = clob_ui_state.clone();
     let ws_online_srv = ws_online.clone();
     let ws_clients_srv = ws_clients.clone();
     let ws_task = tokio::spawn(async move {
         if let Err(e) = ws_server::run_server(
             state_ws,
+            clob_ui_state_ws_srv,
             &ws_addr,
             event_tx,
             ws_online_srv,

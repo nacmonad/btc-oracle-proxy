@@ -341,8 +341,22 @@ pub enum WsEvent {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsClientMessage {
-    Subscribe { channels: Vec<String> },
-    Unsubscribe { channels: Vec<String> },
+    Subscribe {
+        #[serde(default)]
+        channels: Vec<String>,
+        #[serde(default)]
+        assets: Vec<String>,
+        #[serde(default)]
+        timeframes: Vec<String>,
+    },
+    Unsubscribe {
+        #[serde(default)]
+        channels: Vec<String>,
+        #[serde(default)]
+        assets: Vec<String>,
+        #[serde(default)]
+        timeframes: Vec<String>,
+    },
 }
 
 /// Legacy alias kept for compatibility with existing handler stubs.
