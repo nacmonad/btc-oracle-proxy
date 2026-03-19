@@ -61,6 +61,20 @@ pub struct PriceUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub book_age_ms: Option<i64>,
 
+    /// Optional secondary 5m market context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_context_5m: Option<MarketContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_id_5m: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_bid_5m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_ask_5m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub down_bid_5m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub down_ask_5m: Option<f64>,
+
     /// Median-aggregated market price from exchange feeds.
     pub market_price: f64,
 
@@ -76,8 +90,45 @@ pub struct PriceUpdate {
     /// `true` when `abs(deviation_pct) >= 0.10` — OCR2 round likely triggering.
     pub round_imminent: bool,
 
+    /// Optional LMSR probability from active oracle params.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_lmsr: Option<f64>,
+    /// Optional LMSR drift signal vs market-side probability basis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_lmsr: Option<f64>,
+    /// Optional normalized LMSR drift score.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_lmsr_z: Option<f64>,
+    /// Active LMSR param version tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lmsr_version: Option<String>,
+    /// Active alpha used for LMSR quote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpha_live: Option<f64>,
+    /// Active b (liquidity) used for LMSR quote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub b_live: Option<f64>,
+
+    /// Model-estimated expected UP probability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_expected: Option<f64>,
+
+    /// Optional 5m LMSR probability from active oracle params.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_lmsr_5m: Option<f64>,
+    /// Optional 5m LMSR drift signal vs market-side probability basis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_lmsr_5m: Option<f64>,
+    /// Optional 5m normalized LMSR drift score.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_lmsr_z_5m: Option<f64>,
+
     /// Raw per-exchange prices included for bot inspection.
     pub exchange_prices: HashMap<String, f64>,
+
+    /// Per-exchange freshness/latency in milliseconds (now - exchange last_update).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange_latency_ms: Option<HashMap<String, i64>>,
 
     pub indicators: IndicatorValues,
 }
@@ -115,6 +166,9 @@ pub struct IndicatorValues {
     pub rsi_14: Option<f64>,
     pub momentum_10: Option<f64>,
     pub momentum_20: Option<f64>,
+    pub mro_5: Option<f64>,
+    pub mro_10: Option<f64>,
+    pub mro_15: Option<f64>,
     pub volatility: Option<f64>,
     pub bb_upper: Option<f64>,
     pub bb_middle: Option<f64>,
@@ -133,6 +187,9 @@ impl Default for IndicatorValues {
             rsi_14: None,
             momentum_10: None,
             momentum_20: None,
+            mro_5: None,
+            mro_10: None,
+            mro_15: None,
             volatility: None,
             bb_upper: None,
             bb_middle: None,
@@ -142,6 +199,24 @@ impl Default for IndicatorValues {
             macd_histogram: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct LmsrRuntimeParam {
+    pub alpha: f64,
+    pub b: f64,
+    pub version: String,
+    pub effective_from: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExpectedPModelRuntime {
+    pub version: String,
+    pub intercept: f64,
+    pub coefs: HashMap<String, f64>,
+    pub means: HashMap<String, f64>,
+    pub stds: HashMap<String, f64>,
+    pub enabled: bool,
 }
 
 /// Shared application state — held behind `Arc<RwLock<AppState>>`.
@@ -174,6 +249,12 @@ pub struct AppState {
     /// Used to detect `round_settled` (baseline price changed).
     pub prev_chainlink_price: Option<f64>,
 
+    /// Runtime LMSR params pushed via HTTP API.
+    pub lmsr_params: HashMap<String, LmsrRuntimeParam>,
+
+    /// Optional runtime expected-probability model pushed via HTTP API.
+    pub expected_p_model: Option<ExpectedPModelRuntime>,
+
 }
 
 impl AppState {
@@ -191,6 +272,8 @@ impl AppState {
             prev_bb_width_pct: None,
             prev_pre_trigger: false,
             prev_chainlink_price: None,
+            lmsr_params: HashMap::new(),
+            expected_p_model: None,
         }
     }
 }
@@ -291,6 +374,9 @@ pub struct PreTriggerAlertEvent {
     pub bb_width_pct: Option<f64>,
     pub rsi_14: Option<f64>,
     pub momentum_10: Option<f64>,
+    pub mro_5: Option<f64>,
+    pub mro_10: Option<f64>,
+    pub mro_15: Option<f64>,
 }
 
 /// All server → client WebSocket events share this envelope.

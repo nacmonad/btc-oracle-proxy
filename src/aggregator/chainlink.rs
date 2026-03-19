@@ -27,25 +27,23 @@ const CONTRACT: &str = "0xc907E116054Ad103354f2D350FD2514433D57F6F";
 /// `latestRoundData()` function selector.
 const SELECTOR: &str = "0xfeaf968c";
 
-/// Poll interval in seconds.
-const POLL_SECS: u64 = 5;
-
 pub struct ChainlinkClient {
     rpc_url: String,
+    poll_secs: u64,
     state: Arc<RwLock<AppState>>,
 }
 
 impl ChainlinkClient {
-    pub fn new(rpc_url: String, state: Arc<RwLock<AppState>>) -> Self {
-        Self { rpc_url, state }
+    pub fn new(rpc_url: String, poll_secs: u64, state: Arc<RwLock<AppState>>) -> Self {
+        Self { rpc_url, poll_secs: poll_secs.max(1), state }
     }
 
     /// Polls on-chain Chainlink price forever, writing updates to `AppState`.
     pub async fn run(self) {
-        info!("Chainlink poller starting (RPC: {})", self.rpc_url);
+        info!("Chainlink poller starting (RPC: {}, poll_secs: {})", self.rpc_url, self.poll_secs);
         let client = reqwest::Client::new();
         let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(POLL_SECS));
+            tokio::time::interval(tokio::time::Duration::from_secs(self.poll_secs));
 
         loop {
             interval.tick().await;

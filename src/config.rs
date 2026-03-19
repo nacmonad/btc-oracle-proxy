@@ -15,6 +15,7 @@ pub struct Config {
 
     // Polygon JSON-RPC — used to read Chainlink BTC/USD contract on-chain
     pub polygon_rpc_url: String,
+    pub chainlink_poll_secs: u64,
     
     // Indicator settings
     pub ema_short_period: usize,
@@ -62,6 +63,8 @@ impl Config {
                 .unwrap_or_else(|_| "wss://ws.kraken.com/".to_string()),
             polygon_rpc_url: env::var("POLYGON_RPC_URL")
                 .unwrap_or_else(|_| "https://polygon-rpc.com".to_string()),
+            chainlink_poll_secs: env::var("CHAINLINK_POLL_SECS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(5),
 
             ema_short_period: 12,
             ema_long_period: 26,
@@ -71,8 +74,10 @@ impl Config {
             macd_signal_period: 9,
             volatility_period: 20,
             
-            price_history_capacity: 1000,
-            aggregation_interval_ms: 500,
+            price_history_capacity: env::var("PRICE_HISTORY_CAPACITY")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(4000),
+            aggregation_interval_ms: env::var("AGGREGATION_INTERVAL_MS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(500),
 
             clob_enabled: env::var("CLOB_ENABLED")
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))

@@ -97,9 +97,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // ── HTTP API server (metadata/signing scaffold) ─────────────────────────
+    let http_addr = config.http_listen_addr.clone();
+    let state_http = state.clone();
+    let clob_base_url_http = config.clob_gamma_api_url.replace("gamma-api", "clob");
+    let http_task = tokio::spawn(async move {
+        if let Err(e) = http_api::run_server(state_http, &http_addr, &clob_base_url_http).await {
+            log_error!("HTTP API server error: {}", e);
+        }
+    });
+
     // ── TUI ───────────────────────────────────────────────────────────────────
     let state_tui = state.clone();
     let tui_ws_addr = config.ws_listen_addr.clone();
+    let tui_http_addr = config.http_listen_addr.clone();
     let clob_ui_state_tui = clob_ui_state.clone();
     let tui_task = tokio::spawn(async move {
         if let Err(e) = tui::run_tui(
@@ -107,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
             clob_ui_state_tui,
             log_buffer,
             tui_ws_addr,
+            tui_http_addr,
             ws_online,
             ws_clients,
         )
@@ -121,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         _ = aggregator_task => warn!("Aggregator task ended"),
         _ = ws_task         => warn!("WebSocket task ended"),
+        _ = http_task       => warn!("HTTP API task ended"),
         _ = tui_task        => info!("TUI closed — shutting down"),
     }
 

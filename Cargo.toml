@@ -18,6 +18,7 @@ serde_json = "1.0"
 
 # HTTP client
 reqwest = { version = "0.11", features = ["json"] }
+axum = { version = "0.7", features = ["json"] }
 
 # Logging and tracing
 tracing = "0.1"
@@ -37,6 +38,8 @@ num-traits = "0.2"
 # Math utilities
 rust_decimal = "1.33"
 rust_decimal_macros = "1.33"
+polymarket-client-sdk = "0.3"
+alloy = { version = "1.0", features = ["signers", "signer-local"] }
 
 # Database (DuckDB writer for shared researcher.db)
 duckdb = { version = "1.2", features = ["bundled"] }

@@ -64,6 +64,7 @@ struct ClobSideView {
 #[derive(Clone, Default)]
 struct ClobMarketRow {
     close_time: String,
+    close_time_raw: String,
     asset: String,
     timeframe: String,
     condition_id: String,
@@ -96,6 +97,10 @@ struct ClobDiag {
     dropped_fps: f64,
     exchange_update_fps: Vec<(String, f64)>,
     market_frame_fps: f64,
+    active_condition_id: Option<String>,
+    active_close_ts: Option<String>,
+    active_market_slug: Option<String>,
+    active_market_url: Option<String>,
 }
 
 struct Snapshot {
@@ -104,6 +109,13 @@ struct Snapshot {
     chainlink_age_secs: Option<u64>,
     deviation_pct: Option<f64>,
     round_imminent: bool,
+    p_lmsr: Option<f64>,
+    delta_lmsr: Option<f64>,
+    delta_lmsr_z: Option<f64>,
+    p_lmsr_5m: Option<f64>,
+    delta_lmsr_5m: Option<f64>,
+    delta_lmsr_z_5m: Option<f64>,
+    lmsr_version: Option<String>,
     exchange_prices: HashMap<String, f64>,
     /// (name, connected, ms_since_last_update)
     exchange_statuses: Vec<(String, bool, Option<i64>)>,
@@ -116,7 +128,7 @@ impl Snapshot {
     fn from_state(state: &AppState) -> Self {
         let now = Utc::now();
 
-        let (market_price, chainlink_price, chainlink_age_secs, deviation_pct, round_imminent, exchange_prices) =
+        let (market_price, chainlink_price, chainlink_age_secs, deviation_pct, round_imminent, p_lmsr, delta_lmsr, delta_lmsr_z, p_lmsr_5m, delta_lmsr_5m, delta_lmsr_z_5m, lmsr_version, exchange_prices) =
             if let Some(ref u) = state.current_price {
                 (
                     Some(u.market_price),
@@ -124,10 +136,17 @@ impl Snapshot {
                     u.chainlink_age_secs,
                     u.deviation_pct,
                     u.round_imminent,
+                    u.p_lmsr,
+                    u.delta_lmsr,
+                    u.delta_lmsr_z,
+                    u.p_lmsr_5m,
+                    u.delta_lmsr_5m,
+                    u.delta_lmsr_z_5m,
+                    u.lmsr_version.clone(),
                     u.exchange_prices.clone(),
                 )
             } else {
-                (None, None, None, None, false, HashMap::new())
+                (None, None, None, None, false, None, None, None, None, None, None, None, HashMap::new())
             };
 
         let mut exchange_statuses: Vec<(String, bool, Option<i64>)> = state
@@ -154,6 +173,13 @@ impl Snapshot {
             chainlink_age_secs,
             deviation_pct,
             round_imminent,
+            p_lmsr,
+            delta_lmsr,
+            delta_lmsr_z,
+            p_lmsr_5m,
+            delta_lmsr_5m,
+            delta_lmsr_z_5m,
+            lmsr_version,
             exchange_prices,
             exchange_statuses,
             indicators,
@@ -172,6 +198,19 @@ fn format_close_time_compact(s: &str) -> String {
     }
 }
 
+fn parse_close_time_any(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z") {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+    }
+    None
+}
+
 fn timeframe_rank_minutes(tf: &str) -> i64 {
     let t = tf.trim().to_lowercase();
     if let Some(n) = t.strip_suffix('m').and_then(|x| x.parse::<i64>().ok()) {
@@ -187,6 +226,21 @@ fn timeframe_rank_minutes(tf: &str) -> i64 {
 }
 
 fn build_clob_diag(state: &ClobUiState) -> ClobDiag {
+    let active_round = state.latest_round_quote("BTC", "15m");
+    let active_condition_id = active_round.as_ref().map(|r| r.condition_id.clone());
+    let active_close_ts = active_round.as_ref().and_then(|r| r.close_time.clone());
+    let active_market_slug = active_close_ts
+        .as_ref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&Utc)))
+        .map(|dt| {
+            // latest_round_quote is currently 15m in this panel; slug uses round START epoch.
+            let start_epoch = dt.timestamp() - 900;
+            format!("btc-updown-15m-{}", start_epoch)
+        });
+    let active_market_url = active_market_slug
+        .as_ref()
+        .map(|slug| format!("https://polymarket.com/event/{slug}"));
+
     ClobDiag {
         reconnects: state.reconnects,
         dropped_rows: state.dropped_rows,
@@ -210,6 +264,10 @@ fn build_clob_diag(state: &ClobUiState) -> ClobDiag {
         dropped_fps: 0.0,
         exchange_update_fps: Vec::new(),
         market_frame_fps: 0.0,
+        active_condition_id,
+        active_close_ts,
+        active_market_slug,
+        active_market_url,
     }
 }
 
@@ -242,6 +300,7 @@ fn build_clob_market_rows(state: &ClobUiState) -> Vec<ClobMarketRow> {
 
         let e = by_market.entry(condition_id.clone()).or_insert_with(|| ClobMarketRow {
             close_time: close_time.clone(),
+            close_time_raw: close_time_raw.clone(),
             asset: asset.clone(),
             timeframe: timeframe.clone(),
             condition_id: condition_id.clone(),
@@ -278,6 +337,7 @@ pub async fn run_tui(
     clob_state: Arc<RwLock<ClobUiState>>,
     logs: LogBuffer,
     ws_addr: String,
+    http_addr: String,
     ws_online: Arc<AtomicBool>,
     ws_clients: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
@@ -288,7 +348,7 @@ pub async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, state, clob_state, logs, ws_addr, ws_online, ws_clients).await;
+    let result = run_loop(&mut terminal, state, clob_state, logs, ws_addr, http_addr, ws_online, ws_clients).await;
 
     // Always restore the terminal, even on error
     disable_raw_mode()?;
@@ -308,6 +368,7 @@ async fn run_loop(
     clob_state: Arc<RwLock<ClobUiState>>,
     logs: LogBuffer,
     ws_addr: String,
+    http_addr: String,
     ws_online: Arc<AtomicBool>,
     ws_clients: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
@@ -376,6 +437,7 @@ async fn run_loop(
             next_diag.dropped_fps = clob_diag_cache.dropped_fps;
             next_diag.exchange_update_fps = clob_diag_cache.exchange_update_fps.clone();
             next_diag.market_frame_fps = clob_diag_cache.market_frame_fps;
+            // keep latest market mapping values from fresh snapshot, not prior cache
             clob_diag_cache = next_diag;
 
             let dt = last_rate_at.elapsed().as_secs_f64();
@@ -435,6 +497,7 @@ async fn run_loop(
                 clob_selected,
                 &log_lines,
                 &ws_addr,
+                &http_addr,
                 online,
                 clients,
                 page,
@@ -486,6 +549,7 @@ fn draw(
     clob_selected: usize,
     log_lines: &[String],
     ws_addr: &str,
+    http_addr: &str,
     ws_online: bool,
     ws_clients: usize,
     page: Page,
@@ -502,7 +566,7 @@ fn draw(
         ])
         .split(area);
 
-    draw_server_status(f, chunks[0], ws_addr, ws_online, ws_clients, page);
+    draw_server_status(f, chunks[0], ws_addr, http_addr, ws_online, ws_clients, page);
     draw_health(f, chunks[1], snap);
     match page {
         Page::Oracle => draw_prices(f, chunks[2], snap),
@@ -518,6 +582,7 @@ fn draw_server_status(
     f: &mut Frame,
     area: Rect,
     ws_addr: &str,
+    http_addr: &str,
     ws_online: bool,
     ws_clients: usize,
     page: Page,
@@ -560,6 +625,9 @@ fn draw_server_status(
         ),
         Span::styled(status_str, Style::default().fg(dot_color)),
         Span::styled(client_str, Style::default().fg(Color::DarkGray)),
+        Span::styled("   ● ", Style::default().fg(Color::Yellow)),
+        Span::styled("HTTP ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("http://{http_addr}  up"), Style::default().fg(Color::Yellow)),
         Span::styled("    ", Style::default().fg(Color::DarkGray)),
         Span::styled(page_label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled("   [1] Oracle  [2] CLOB  [Tab] switch  [q] quit", Style::default().fg(Color::DarkGray)),
@@ -790,12 +858,23 @@ fn draw_clob_page(f: &mut Frame, area: Rect, rows: &[ClobMarketRow], selected: u
     let dn_ask5 = down.ask_depth5.unwrap_or(0.0);
     let dn_max = dn_bid5.max(dn_ask5).max(1.0);
 
+    let tf_secs: i64 = if sel.timeframe == "5m" { 300 } else { 900 };
+    let market_slug = parse_close_time_any(&sel.close_time_raw)
+        .map(|dt| {
+            let start_epoch = dt.timestamp() - tf_secs;
+            format!("btc-updown-{}-{}", sel.timeframe, start_epoch)
+        });
+    let market_url = market_slug
+        .as_ref()
+        .map(|slug| format!("https://polymarket.com/event/{slug}"));
+
     let detail = Paragraph::new(vec![
         Line::from(Span::styled("Selected Market", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         Line::from(format!("close: {}", sel.close_time)),
         Line::from(format!("asset: {}", sel.asset)),
         Line::from(format!("tf: {}", sel.timeframe)),
         Line::from(format!("condition: {}", sel.condition_id)),
+        Line::from(format!("url: {}", market_url.unwrap_or_else(|| "-".to_string()))),
         Line::from(format!("pivot(tf): {}", sel.pivot.map(|p| format!("{p:.4}")).unwrap_or_else(|| "-".into()))),
         Line::from(""),
         Line::from(Span::styled("UP token", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
@@ -845,6 +924,9 @@ fn draw_ingest_page(f: &mut Frame, area: Rect, d: &ClobDiag) {
         Line::from(Span::styled("Live Counters", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         Line::from(format!("tokens={}  markets={}  reconnects={}  last_backoff_ms={}", d.tokens_len, d.markets_len, d.reconnects, d.last_backoff_ms)),
         Line::from(format!("last_message_at={}", d.last_message_at.clone().unwrap_or_else(|| "-".into()))),
+        Line::from(format!("active_condition_id={}", d.active_condition_id.clone().unwrap_or_else(|| "-".into()))),
+        Line::from(format!("active_close_ts={}", d.active_close_ts.clone().unwrap_or_else(|| "-".into()))),
+        Line::from(format!("active_market_url={}", d.active_market_url.clone().unwrap_or_else(|| "-".into()))),
         Line::from(""),
         Line::from(Span::styled("Sampling", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
         Line::from(format!("ingested={} emitted={} emit_ratio={:.3}", d.sampler_ingested_rows, d.sampler_emitted_rows, emit_ratio)),
@@ -974,6 +1056,70 @@ fn draw_main_stats(f: &mut Frame, area: Rect, snap: &Snapshot) {
             ]));
         }
     }
+
+    lines.push(Line::from(""));
+
+    // LMSR snapshot
+    let lmsr_p = snap
+        .p_lmsr
+        .map(|v| format!("{v:>16.4}"))
+        .unwrap_or_else(|| "      awaiting...".to_string());
+    let lmsr_delta = snap
+        .delta_lmsr
+        .map(|v| format!("{v:+.4}"))
+        .unwrap_or_else(|| "—".to_string());
+    let lmsr_z = snap
+        .delta_lmsr_z
+        .map(|v| format!("{v:+.2}"))
+        .unwrap_or_else(|| "—".to_string());
+    let lmsr_ver = snap
+        .lmsr_version
+        .clone()
+        .unwrap_or_else(|| "—".to_string());
+
+    lines.push(Line::from(vec![
+        Span::styled("  LMSR p         ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            lmsr_p,
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  LMSR Δ / z     ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{lmsr_delta:>8}  z={lmsr_z:>6}"),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::styled(
+            format!("   v={lmsr_ver}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+
+    let lmsr_p_5m = snap
+        .p_lmsr_5m
+        .map(|v| format!("{v:>16.4}"))
+        .unwrap_or_else(|| "      awaiting...".to_string());
+    let lmsr_delta_5m = snap
+        .delta_lmsr_5m
+        .map(|v| format!("{v:+.4}"))
+        .unwrap_or_else(|| "—".to_string());
+    let lmsr_z_5m = snap
+        .delta_lmsr_z_5m
+        .map(|v| format!("{v:+.2}"))
+        .unwrap_or_else(|| "—".to_string());
+
+    lines.push(Line::from(vec![
+        Span::styled("  LMSR 5m p      ", Style::default().fg(Color::DarkGray)),
+        Span::styled(lmsr_p_5m, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  LMSR 5m Δ / z  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{lmsr_delta_5m:>8}  z={lmsr_z_5m:>6}"),
+            Style::default().fg(Color::Cyan),
+        ),
+    ]));
 
     lines.push(Line::from(""));
 
@@ -1123,6 +1269,9 @@ fn draw_indicators(f: &mut Frame, area: Rect, snap: &Snapshot) {
         Line::from(vec![label("  RSI 14   "), rsi_span]),
         Line::from(vec![label("  ROC 10   "), roc_span(ind.momentum_10)]),
         Line::from(vec![label("  ROC 20   "), roc_span(ind.momentum_20)]),
+        Line::from(vec![label("  MRO 5    "), fmt_opt(ind.mro_5, 1)]),
+        Line::from(vec![label("  MRO 10   "), fmt_opt(ind.mro_10, 1)]),
+        Line::from(vec![label("  MRO 15   "), fmt_opt(ind.mro_15, 1)]),
         Line::from(""),
         Line::from(vec![label("  StdDev   "), fmt_opt(ind.volatility, 2)]),
         Line::from(vec![label("  BB Upper "), fmt_opt(ind.bb_upper, 2)]),

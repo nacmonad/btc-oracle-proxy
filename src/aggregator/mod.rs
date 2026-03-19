@@ -55,16 +55,22 @@ pub async fn run_aggregator(
     // ── Chainlink baseline task ─────────────────────────────────────────────
     let chainlink_client = chainlink::ChainlinkClient::new(
         config.polygon_rpc_url.clone(),
+        config.chainlink_poll_secs,
         state.clone(),
     );
     tokio::spawn(async move { chainlink_client.run().await });
 
     // ── Aggregation loop ────────────────────────────────────────────────────
+    let bars_per_min = (60_000u64 / config.aggregation_interval_ms.max(50)).max(1) as usize;
     let indicator_cfg = IndicatorConfig {
         ema_short_period: config.ema_short_period,
         ema_long_period: config.ema_long_period,
         rsi_period: config.rsi_period,
         volatility_period: config.volatility_period,
+        mro_5_bars: 5 * bars_per_min,
+        mro_10_bars: 10 * bars_per_min,
+        mro_15_bars: 15 * bars_per_min,
+        mro_rank_window: (30 * bars_per_min).max(120),
     };
     let capacity = config.price_history_capacity;
 
@@ -149,10 +155,20 @@ pub async fn run_aggregator(
 
                 let exchange_prices: HashMap<String, f64> =
                     fresh.iter().map(|p| (p.exchange.clone(), p.price)).collect();
+                let exchange_latency_ms: HashMap<String, i64> = s
+                    .exchange_status
+                    .iter()
+                    .filter_map(|kv| {
+                        kv.last_update.map(|lu| {
+                            let age = now.signed_duration_since(lu).num_milliseconds().max(0);
+                            (kv.exchange.clone(), age)
+                        })
+                    })
+                    .collect();
 
-                let market_context = {
+                let (market_context, market_context_5m) = {
                     let clob = clob_ui_state.read().await;
-                    clob.latest_round_quote("BTC", "15m").map(|rq| {
+                    let to_ctx = |rq: crate::clob::state::RoundQuote| {
                         let age_up = now.signed_duration_since(rq.up.updated_at).num_milliseconds();
                         let age_down = now.signed_duration_since(rq.down.updated_at).num_milliseconds();
                         let book_age_ms = Some(age_up.max(age_down).max(0));
@@ -169,7 +185,11 @@ pub async fn run_aggregator(
                             round_close_ts: rq.close_time,
                             book_age_ms,
                         }
-                    })
+                    };
+                    (
+                        clob.round_quote_at("BTC", "15m", now, 3600, 45).map(to_ctx),
+                        clob.round_quote_at("BTC", "5m", now, 3600, 45).map(to_ctx),
+                    )
                 };
 
                 let condition_id = market_context.as_ref().map(|m| m.condition_id.clone());
@@ -182,25 +202,136 @@ pub async fn run_aggregator(
                 let round_close_ts = market_context.as_ref().and_then(|m| m.round_close_ts.clone());
                 let book_age_ms = market_context.as_ref().and_then(|m| m.book_age_ms);
 
+                let condition_id_5m = market_context_5m.as_ref().map(|m| m.condition_id.clone());
+                let up_bid_5m = market_context_5m.as_ref().and_then(|m| m.up_bid);
+                let up_ask_5m = market_context_5m.as_ref().and_then(|m| m.up_ask);
+                let down_bid_5m = market_context_5m.as_ref().and_then(|m| m.down_bid);
+                let down_ask_5m = market_context_5m.as_ref().and_then(|m| m.down_ask);
+
+                let active_lmsr = s
+                    .lmsr_params
+                    .values()
+                    .filter(|p| p.effective_from <= now)
+                    .max_by_key(|p| p.effective_from)
+                    .cloned();
+
+                let market_probability = if let (Some(b), Some(a)) = (up_bid, up_ask) {
+                    let m = (b + a) * 0.5;
+                    if m.is_finite() && m > 0.0 && m < 1.0 { Some(m) } else { None }
+                } else if let (Some(b), Some(a)) = (down_bid, down_ask) {
+                    let m = 1.0 - ((b + a) * 0.5);
+                    if m.is_finite() && m > 0.0 && m < 1.0 { Some(m) } else { None }
+                } else {
+                    None
+                };
+
+                let market_probability_5m = if let (Some(b), Some(a)) = (up_bid_5m, up_ask_5m) {
+                    let m = (b + a) * 0.5;
+                    if m.is_finite() && m > 0.0 && m < 1.0 { Some(m) } else { None }
+                } else if let (Some(b), Some(a)) = (down_bid_5m, down_ask_5m) {
+                    let m = 1.0 - ((b + a) * 0.5);
+                    if m.is_finite() && m > 0.0 && m < 1.0 { Some(m) } else { None }
+                } else {
+                    None
+                };
+
+                let expected_model = s.expected_p_model.clone().filter(|m| m.enabled);
+                let p_expected = if let (Some(mdl), Some(p_mkt)) = (expected_model.as_ref(), market_probability) {
+                    let tau_sec = round_close_ts
+                        .as_ref()
+                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc).signed_duration_since(now).num_seconds().max(0) as f64)
+                        .unwrap_or(0.0);
+                    let mut feat: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+                    feat.insert("tau_sec".to_string(), tau_sec);
+                    feat.insert("p_market".to_string(), p_mkt);
+                    feat.insert("deviation_pct".to_string(), deviation_pct.unwrap_or(0.0));
+                    feat.insert("chainlink_age_secs".to_string(), chainlink_age_secs.unwrap_or(0) as f64);
+                    feat.insert("up_bid".to_string(), up_bid.unwrap_or(0.0));
+                    feat.insert("up_ask".to_string(), up_ask.unwrap_or(0.0));
+                    feat.insert("down_bid".to_string(), down_bid.unwrap_or(0.0));
+                    feat.insert("down_ask".to_string(), down_ask.unwrap_or(0.0));
+                    feat.insert("up_spread".to_string(), market_context.as_ref().and_then(|m| m.up_spread).unwrap_or(0.0));
+                    feat.insert("down_spread".to_string(), market_context.as_ref().and_then(|m| m.down_spread).unwrap_or(0.0));
+                    let mut z = mdl.intercept;
+                    for (k, w) in mdl.coefs.iter() {
+                        let x = *feat.get(k).unwrap_or(&0.0);
+                        let mu = *mdl.means.get(k).unwrap_or(&0.0);
+                        let sd = mdl.stds.get(k).copied().unwrap_or(1.0).abs().max(1e-9);
+                        z += w * ((x - mu) / sd);
+                    }
+                    Some(1.0 / (1.0 + (-z).exp()))
+                } else {
+                    None
+                };
+
+                let (p_lmsr, delta_lmsr, delta_lmsr_z, lmsr_version, alpha_live, b_live, p_lmsr_5m, delta_lmsr_5m, delta_lmsr_z_5m) =
+                    if let (Some(p_e), Some(p_mkt)) = (p_expected, market_probability) {
+                        let d = p_e - p_mkt;
+                        (Some(p_e), Some(d), Some(d / 0.01_f64.max(1e-6)), expected_model.as_ref().map(|m| format!("expected-p:{}", m.version)), None, None, None, None, None)
+                    } else if let Some(prm) = active_lmsr {
+                        let calc = |p_mkt: Option<f64>| {
+                            p_mkt.map(|p| {
+                                let logit_m = (p / (1.0 - p)).ln();
+                                let p_l = 1.0 / (1.0 + (-(prm.alpha * logit_m)).exp());
+                                let d = p_l - p;
+                                (p_l, d, d / 0.01_f64.max(1e-6))
+                            })
+                        };
+
+                        let main = calc(market_probability);
+                        let m5 = calc(market_probability_5m);
+
+                        (
+                            main.map(|x| x.0),
+                            main.map(|x| x.1),
+                            main.map(|x| x.2),
+                            Some(prm.version),
+                            Some(prm.alpha),
+                            Some(prm.b),
+                            m5.map(|x| x.0),
+                            m5.map(|x| x.1),
+                            m5.map(|x| x.2),
+                        )
+                    } else {
+                        (None, None, None, None, None, None, None, None, None)
+                    };
                 s.current_price = Some(PriceUpdate {
                     timestamp: now,
                     symbol: "BTC/USD".to_string(),
                     market_context,
-                    condition_id,
+                    condition_id: condition_id.clone(),
                     token_yes_id,
                     token_no_id,
                     up_bid,
                     up_ask,
                     down_bid,
                     down_ask,
-                    round_close_ts,
+                    round_close_ts: round_close_ts.clone(),
                     book_age_ms,
+                    market_context_5m,
+                    condition_id_5m,
+                    up_bid_5m,
+                    up_ask_5m,
+                    down_bid_5m,
+                    down_ask_5m,
                     market_price,
                     chainlink_price,
                     chainlink_age_secs,
                     deviation_pct,
                     round_imminent,
+                    p_lmsr,
+                    delta_lmsr,
+                    delta_lmsr_z,
+                    lmsr_version,
+                    alpha_live,
+                    b_live,
+                    p_expected,
+                    p_lmsr_5m,
+                    delta_lmsr_5m,
+                    delta_lmsr_z_5m,
                     exchange_prices: exchange_prices.clone(),
+                    exchange_latency_ms: if exchange_latency_ms.is_empty() { None } else { Some(exchange_latency_ms.clone()) },
                     indicators: indicators.clone(),
                 });
                 s.last_update = Some(now);
@@ -252,9 +383,21 @@ pub async fn run_aggregator(
                     {
                         let direction = if dev > 0.0 { RoundDirection::Up } else { RoundDirection::Down };
                         let dir_str = if dev > 0.0 { "UP" } else { "DOWN" };
+                        let close_ts_dbg = round_close_ts.clone();
+                        let slug_dbg = close_ts_dbg.as_ref().and_then(|s| {
+                            chrono::DateTime::parse_from_rfc3339(s)
+                                .ok()
+                                .map(|dt| format!("btc-updown-15m-{}", dt.timestamp() - 900))
+                        });
+                        let url_dbg = slug_dbg.as_ref().map(|slug| format!("https://polymarket.com/event/{slug}"));
                         info!(
                             "⚡ ROUND TRIGGERED {dir_str}: market=${market_price:.2}  \
-                             chainlink=${cl:.2}  deviation={dev:+.3}%  age={age}s"
+                             chainlink=${cl:.2}  deviation={dev:+.3}%  age={age}s  \
+                             map(condition_id={:?} close_ts={:?} slug={:?} url={:?})",
+                            condition_id,
+                            close_ts_dbg,
+                            slug_dbg,
+                            url_dbg,
                         );
                         outbound.push(WsEvent::RoundTriggered {
                             ts: now,
@@ -359,9 +502,21 @@ pub async fn run_aggregator(
                         let dev = deviation_pct.unwrap_or(0.0);
                         let dir_str = if matches!(direction, RoundDirection::Up) { "UP" } else { "DOWN" };
                         let sig_str = signals.join(", ");
+                        let close_ts_dbg = round_close_ts.clone();
+                        let slug_dbg = close_ts_dbg.as_ref().and_then(|s| {
+                            chrono::DateTime::parse_from_rfc3339(s)
+                                .ok()
+                                .map(|dt| format!("btc-updown-15m-{}", dt.timestamp() - 900))
+                        });
+                        let url_dbg = slug_dbg.as_ref().map(|slug| format!("https://polymarket.com/event/{slug}"));
                         info!(
                             "🎯 PRE-TRIGGER ALERT {dir_str}: dev={dev:+.3}%  \
-                             market=${market_price:.2}  signals=[{sig_str}]"
+                             market=${market_price:.2}  signals=[{sig_str}]  \
+                             map(condition_id={:?} close_ts={:?} slug={:?} url={:?})",
+                            condition_id,
+                            close_ts_dbg,
+                            slug_dbg,
+                            url_dbg,
                         );
                         outbound.push(WsEvent::PreTriggerAlert {
                             ts: now,
@@ -375,6 +530,9 @@ pub async fn run_aggregator(
                                 bb_width_pct: curr_bb_width,
                                 rsi_14: indicators.rsi_14,
                                 momentum_10: indicators.momentum_10,
+                                mro_5: indicators.mro_5,
+                                mro_10: indicators.mro_10,
+                                mro_15: indicators.mro_15,
                             },
                         });
                     }

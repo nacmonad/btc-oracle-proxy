@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -17,6 +18,8 @@ use crate::config::Config;
 
 type TokenRec = (String, String, String, String, String, String); // (condition_id, token_id, asset, timeframe, close_time, side)
 
+static CLOB_WS_DEBUG_COUNT: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone)]
 struct MarketRec {
     condition_id: String,
@@ -29,6 +32,7 @@ struct MarketRec {
     resolved_at: Option<String>,
     token_yes_id: String,
     token_no_id: String,
+    pivot_price: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -202,25 +206,63 @@ fn extract_tokens(m: &serde_json::Value) -> Option<(String, String)> {
     None
 }
 
-fn parse_pivot_from_question(q: &str) -> Option<f64> {
-    let mut num = String::new();
-    let mut found = Vec::new();
-    for ch in q.chars() {
-        if ch.is_ascii_digit() || ch == '.' {
-            num.push(ch);
-        } else if !num.is_empty() {
-            if let Ok(v) = num.parse::<f64>() {
-                found.push(v);
+
+fn tf_variant(tf: &str) -> &'static str {
+    match tf {
+        "5m" => "five",
+        "15m" => "fifteen",
+        _ => "fifteen",
+    }
+}
+
+fn parse_iso_utc(s: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&Utc))
+}
+
+fn derive_pivot_from_past_results(resp: &serde_json::Value, current_event_start: &str) -> Option<f64> {
+    let rows = resp.get("data")?.get("results")?.as_array()?;
+    let target = parse_iso_utc(current_event_start);
+
+    for row in rows {
+        let end_ts = row.get("endTime").and_then(|v| v.as_str()).and_then(parse_iso_utc);
+        if end_ts.is_some() && end_ts == target {
+            if let Some(v) = row.get("closePrice").and_then(|v| v.as_f64()) {
+                return Some(v);
             }
-            num.clear();
         }
     }
-    if !num.is_empty() {
-        if let Ok(v) = num.parse::<f64>() {
-            found.push(v);
+    for row in rows {
+        let start_ts = row.get("startTime").and_then(|v| v.as_str()).and_then(parse_iso_utc);
+        if start_ts.is_some() && start_ts == target {
+            if let Some(v) = row.get("openPrice").and_then(|v| v.as_f64()) {
+                return Some(v);
+            }
         }
     }
-    found.into_iter().max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    rows.last()?.get("closePrice")?.as_f64()
+}
+
+async fn fetch_pivot_price(client: &Client, asset: &str, timeframe: &str, event_start: &str) -> Option<f64> {
+    let url = "https://polymarket.com/api/past-results";
+    let asset_type = "crypto";
+    let symbol = asset.to_uppercase();
+    let variant = tf_variant(timeframe);
+    let res = client
+        .get(url)
+        .query(&[
+            ("symbol", symbol.as_str()),
+            ("variant", variant),
+            ("assetType", asset_type),
+            ("currentEventStartTime", event_start),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = res.json().await.ok()?;
+    derive_pivot_from_past_results(&v, event_start)
 }
 
 fn parse_market_outcome(m: &serde_json::Value) -> (Option<String>, Option<f64>, Option<String>) {
@@ -298,6 +340,7 @@ fn to_market_upserts(markets: &[MarketRec]) -> Vec<MarketUpsertRow> {
             winning_price: m.winning_price,
             token_yes_id: m.token_yes_id.clone(),
             token_no_id: m.token_no_id.clone(),
+            pivot_price: m.pivot_price,
         })
         .collect()
 }
@@ -372,6 +415,24 @@ async fn load_active_tokens(cfg: &Config) -> anyhow::Result<DiscoveryBatch> {
                         resolved_at,
                         token_yes_id: yes.clone(),
                         token_no_id: no.clone(),
+                        pivot_price: {
+                            let event_start = m
+                                .get("eventStartTime")
+                                .or_else(|| m.get("startTime"))
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string())
+                                .or_else(|| {
+                                    parse_close_time_to_utc(&close_time).map(|ct| {
+                                        let tf_secs = timeframe_secs(tf).unwrap_or(900);
+                                        (ct - chrono::Duration::seconds(tf_secs)).to_rfc3339()
+                                    })
+                                });
+                            if let Some(es) = event_start {
+                                fetch_pivot_price(&client, asset, tf, &es).await
+                            } else {
+                                None
+                            }
+                        },
                     });
 
                     out.push((cid.clone(), yes, asset.clone(), tf.clone(), close_time.clone(), "UP".to_string()));
@@ -415,7 +476,7 @@ pub async fn run_ws_first(writer: ClobWriter, cfg: Config, ui_state: Arc<RwLock<
         let pivot_by_condition: HashMap<String, Option<f64>> = discovery
             .markets
             .iter()
-            .map(|m| (m.condition_id.clone(), parse_pivot_from_question(&m.question)))
+            .map(|m| (m.condition_id.clone(), m.pivot_price))
             .collect();
 
         let market_rows = to_market_upserts(&discovery.markets);
@@ -553,6 +614,9 @@ async fn handle_message(
     sampler: &mut L2Sampler,
 ) -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_str(txt)?;
+    let debug_ws_keys = std::env::var("CLOB_WS_DEBUG_KEYS")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
 
     let items: Vec<serde_json::Value> = if v.is_array() {
         v.as_array().cloned().unwrap_or_default()
@@ -561,6 +625,28 @@ async fn handle_message(
     };
 
     for item in items {
+        if debug_ws_keys {
+            let n = CLOB_WS_DEBUG_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 80 {
+                let keys = item
+                    .as_object()
+                    .map(|o| o.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                info!(
+                    debug_seq=n,
+                    has_bids=item.get("bids").is_some(),
+                    has_asks=item.get("asks").is_some(),
+                    has_asset_id=item.get("asset_id").is_some(),
+                    has_market=item.get("market").is_some(),
+                    has_tick_size=item.get("tick_size").is_some(),
+                    has_fee_rate_bps=item.get("fee_rate_bps").is_some() || item.get("base_fee").is_some(),
+                    has_neg_risk=item.get("neg_risk").is_some(),
+                    keys=?keys,
+                    "clob ws debug msg keys"
+                );
+            }
+        }
+
         let bids = item.get("bids").and_then(|x| x.as_array());
         let asks = item.get("asks").and_then(|x| x.as_array());
         if bids.is_none() && asks.is_none() { continue; }

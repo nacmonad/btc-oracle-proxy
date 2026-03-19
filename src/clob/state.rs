@@ -145,9 +145,14 @@ impl ClobUiState {
         );
     }
 
-    pub fn latest_round_quote(&self, asset: &str, preferred_timeframe: &str) -> Option<RoundQuote> {
-        let now = Utc::now();
-
+    pub fn round_quote_at(
+        &self,
+        asset: &str,
+        preferred_timeframe: &str,
+        ref_ts: DateTime<Utc>,
+        max_lookahead_secs: i64,
+        past_grace_secs: i64,
+    ) -> Option<RoundQuote> {
         let mut candidates: HashMap<String, (Option<DateTime<Utc>>, Option<String>, Option<String>, Option<String>)> = HashMap::new();
         for m in self.markets.values() {
             if !m.asset.eq_ignore_ascii_case(asset) {
@@ -169,24 +174,42 @@ impl ClobUiState {
         }
 
         let mut picked: Option<(String, Option<DateTime<Utc>>, Option<String>, String, String)> = None;
+        let mut picked_any: Option<(String, Option<DateTime<Utc>>, Option<String>, String, String)> = None;
+
         for (cid, (close_dt, close_raw, up, down)) in candidates {
             let (Some(up_id), Some(down_id)) = (up, down) else { continue };
-            let score = close_dt.map(|dt| dt.signed_duration_since(now).num_seconds()).unwrap_or(i64::MAX);
-            if score < 0 {
+            let delta = close_dt.map(|dt| dt.signed_duration_since(ref_ts).num_seconds()).unwrap_or(i64::MAX);
+            let score = delta.abs();
+
+            // Best-any fallback (no time window) to avoid starving oracle frame
+            // when close_time parsing/windowing misses but L1/L2 is live.
+            match &picked_any {
+                None => picked_any = Some((cid.clone(), close_dt, close_raw.clone(), up_id.clone(), down_id.clone())),
+                Some((_, best_dt, _, _, _)) => {
+                    let best_delta = best_dt.map(|dt| dt.signed_duration_since(ref_ts).num_seconds()).unwrap_or(i64::MAX);
+                    if score < best_delta.abs() {
+                        picked_any = Some((cid.clone(), close_dt, close_raw.clone(), up_id.clone(), down_id.clone()));
+                    }
+                }
+            }
+
+            // Accept close times slightly in the past (grace) and up to configured lookahead.
+            if delta < -past_grace_secs || delta > max_lookahead_secs {
                 continue;
             }
+
             match &picked {
                 None => picked = Some((cid, close_dt, close_raw, up_id, down_id)),
                 Some((_, best_dt, _, _, _)) => {
-                    let best_score = best_dt.map(|dt| dt.signed_duration_since(now).num_seconds()).unwrap_or(i64::MAX);
-                    if score < best_score {
+                    let best_delta = best_dt.map(|dt| dt.signed_duration_since(ref_ts).num_seconds()).unwrap_or(i64::MAX);
+                    if score < best_delta.abs() {
                         picked = Some((cid, close_dt, close_raw, up_id, down_id));
                     }
                 }
             }
         }
 
-        let (condition_id, _close_dt, close_raw, up_id, down_id) = picked?;
+        let (condition_id, _close_dt, close_raw, up_id, down_id) = picked.or(picked_any)?;
         let up = self.tokens.get(&up_id)?;
         let down = self.tokens.get(&down_id)?;
 
@@ -208,6 +231,10 @@ impl ClobUiState {
                 updated_at: down.updated_at,
             },
         })
+    }
+
+    pub fn latest_round_quote(&self, asset: &str, preferred_timeframe: &str) -> Option<RoundQuote> {
+        self.round_quote_at(asset, preferred_timeframe, Utc::now(), 3600, 45)
     }
 }
 

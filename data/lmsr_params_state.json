@@ -1,0 +1,16 @@
+{
+  "pending": {
+    "bootstrap-a0.75-b0.03-20260308T171230Z": {
+      "alpha": 0.75,
+      "b": 0.03,
+      "version": "bootstrap-a0.75-b0.03-20260308T171230Z",
+      "effective_from": "2026-03-08T17:12:30Z",
+      "trained_at": "2026-03-08T17:12:18.861796Z",
+      "train_window": "walkforward",
+      "notes": "seed after restart + LMSR state persistence",
+      "status": "pending",
+      "stored_at": "2026-03-08T17:12:18.917083247Z"
+    }
+  },
+  "last_good_version": null
+}

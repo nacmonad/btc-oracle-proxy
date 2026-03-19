@@ -7,6 +7,32 @@ pub mod composite;
 
 use crate::models::IndicatorValues;
 
+fn mro_percentile(prices: &[f64], lookback_bars: usize, rank_window: usize) -> Option<f64> {
+    if prices.len() < lookback_bars + 2 {
+        return None;
+    }
+    let mut rets: Vec<f64> = Vec::new();
+    let start = lookback_bars;
+    for i in start..prices.len() {
+        let base = prices[i - lookback_bars];
+        if base > 0.0 {
+            rets.push((prices[i] / base - 1.0) * 100.0);
+        }
+    }
+    if rets.len() < 20 {
+        return None;
+    }
+    let w = rank_window.min(rets.len()).max(20);
+    let slice = &rets[rets.len() - w..];
+    let last = *slice.last()?;
+    let mut less_eq = 0usize;
+    for v in slice {
+        if *v <= last { less_eq += 1; }
+    }
+    let pct = (less_eq as f64) / (slice.len() as f64);
+    Some(pct * 200.0 - 100.0)
+}
+
 /// Calculates all indicators for a given price history
 pub fn calculate_all_indicators(prices: &[f64], config: &IndicatorConfig) -> IndicatorValues {
     let bb = volatility::bollinger_bands(prices, config.volatility_period, 2.0);
@@ -19,6 +45,9 @@ pub fn calculate_all_indicators(prices: &[f64], config: &IndicatorConfig) -> Ind
         rsi_14: momentum::rsi(prices, config.rsi_period),
         momentum_10: momentum::roc(prices, 10),
         momentum_20: momentum::roc(prices, 20),
+        mro_5: mro_percentile(prices, config.mro_5_bars, config.mro_rank_window),
+        mro_10: mro_percentile(prices, config.mro_10_bars, config.mro_rank_window),
+        mro_15: mro_percentile(prices, config.mro_15_bars, config.mro_rank_window),
         volatility: volatility::standard_deviation(prices, config.volatility_period),
         bb_upper: bb.map(|b| b.0),
         bb_middle: bb.map(|b| b.1),
@@ -34,4 +63,8 @@ pub struct IndicatorConfig {
     pub ema_long_period: usize,
     pub rsi_period: usize,
     pub volatility_period: usize,
+    pub mro_5_bars: usize,
+    pub mro_10_bars: usize,
+    pub mro_15_bars: usize,
+    pub mro_rank_window: usize,
 }

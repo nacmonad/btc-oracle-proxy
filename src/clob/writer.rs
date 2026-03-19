@@ -3,7 +3,7 @@ use duckdb::{params, Connection};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::clob::state::ClobUiState;
 use crate::models::{RoundDirection, WsEvent};
@@ -57,6 +57,7 @@ pub struct MarketUpsertRow {
     pub winning_price: Option<f64>,
     pub token_yes_id: String,
     pub token_no_id: String,
+    pub pivot_price: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +116,7 @@ fn open_db() -> anyhow::Result<Connection> {
             winning_price        DOUBLE,
             token_yes_id         VARCHAR,
             token_no_id          VARCHAR,
+            pivot_price          DOUBLE,
             created_at           TIMESTAMPTZ DEFAULT now(),
             last_updated         TIMESTAMPTZ
         );
@@ -159,6 +161,8 @@ fn open_db() -> anyhow::Result<Connection> {
             PRIMARY KEY (ts, token_id, side, level)
         );
 
+        ALTER TABLE pm_markets ADD COLUMN IF NOT EXISTS pivot_price DOUBLE;
+
         CREATE INDEX IF NOT EXISTS idx_pm_markets_close_time ON pm_markets (close_time);
         CREATE INDEX IF NOT EXISTS idx_pm_snapshots_cond ON pm_snapshots (condition_id, ts);
         CREATE INDEX IF NOT EXISTS idx_ob_levels_token_ts ON pm_order_book_levels (token_id, ts);
@@ -174,12 +178,18 @@ fn open_db() -> anyhow::Result<Connection> {
             price_binance        DOUBLE,
             price_coinbase       DOUBLE,
             price_kraken         DOUBLE,
+            latency_binance_ms   BIGINT,
+            latency_coinbase_ms  BIGINT,
+            latency_kraken_ms    BIGINT,
             ema_12               DOUBLE,
             ema_26               DOUBLE,
             ema_50               DOUBLE,
             rsi_14               DOUBLE,
             momentum_10          DOUBLE,
             momentum_20          DOUBLE,
+            mro_5                DOUBLE,
+            mro_10               DOUBLE,
+            mro_15               DOUBLE,
             volatility           DOUBLE,
             bb_upper             DOUBLE,
             bb_middle            DOUBLE,
@@ -187,8 +197,27 @@ fn open_db() -> anyhow::Result<Connection> {
             macd                 DOUBLE,
             macd_signal          DOUBLE,
             macd_histogram       DOUBLE,
+            p_lmsr               DOUBLE,
+            delta_lmsr           DOUBLE,
+            delta_lmsr_z         DOUBLE,
+            lmsr_version         VARCHAR,
+            alpha_live           DOUBLE,
+            b_live               DOUBLE,
             PRIMARY KEY (ts, symbol)
         );
+
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS latency_binance_ms BIGINT;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS latency_coinbase_ms BIGINT;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS latency_kraken_ms BIGINT;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS p_lmsr DOUBLE;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS delta_lmsr DOUBLE;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS delta_lmsr_z DOUBLE;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS lmsr_version VARCHAR;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS alpha_live DOUBLE;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS b_live DOUBLE;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS mro_5 DOUBLE;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS mro_10 DOUBLE;
+        ALTER TABLE oracle_ticks ADD COLUMN IF NOT EXISTS mro_15 DOUBLE;
 
         CREATE TABLE IF NOT EXISTS signal_events (
             id                   BIGINT,
@@ -209,11 +238,18 @@ fn open_db() -> anyhow::Result<Connection> {
             bb_width_pct         DOUBLE,
             rsi_14               DOUBLE,
             momentum_10          DOUBLE,
+            mro_5                DOUBLE,
+            mro_10               DOUBLE,
+            mro_15               DOUBLE,
             bb_upper             DOUBLE,
             bb_lower             DOUBLE,
             bb_expanding         BOOLEAN,
             raw_json             VARCHAR
         );
+        ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS mro_5 DOUBLE;
+        ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS mro_10 DOUBLE;
+        ALTER TABLE signal_events ADD COLUMN IF NOT EXISTS mro_15 DOUBLE;
+
         CREATE INDEX IF NOT EXISTS idx_signal_events_ts ON signal_events (ts);
         CREATE INDEX IF NOT EXISTS idx_signal_events_type ON signal_events (event_type, ts);
         "#,
@@ -357,9 +393,9 @@ fn flush_oracle_events(conn: &mut Connection, events: &mut Vec<WsEvent>, write_t
     let tx = conn.transaction()?;
     {
         let mut tick_stmt = if write_ticks {
-            Some(tx.prepare("INSERT OR IGNORE INTO oracle_ticks (ts,symbol,market_price,chainlink_price,chainlink_age_secs,deviation_pct,round_imminent,price_binance,price_coinbase,price_kraken,ema_12,ema_26,ema_50,rsi_14,momentum_10,momentum_20,volatility,bb_upper,bb_middle,bb_lower,macd,macd_signal,macd_histogram) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")?)
+            Some(tx.prepare("INSERT OR IGNORE INTO oracle_ticks (ts,symbol,market_price,chainlink_price,chainlink_age_secs,deviation_pct,round_imminent,price_binance,price_coinbase,price_kraken,latency_binance_ms,latency_coinbase_ms,latency_kraken_ms,ema_12,ema_26,ema_50,rsi_14,momentum_10,momentum_20,mro_5,mro_10,mro_15,volatility,bb_upper,bb_middle,bb_lower,macd,macd_signal,macd_histogram,p_lmsr,delta_lmsr,delta_lmsr_z,lmsr_version,alpha_live,b_live) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")?)
         } else { None };
-        let mut sig_stmt = tx.prepare("INSERT INTO signal_events (ts,event_type,symbol,direction,deviation_pct,market_price,chainlink_price,chainlink_age_secs,prev_price,new_price,price_delta,delta_pct,round_duration_secs,signals_json,bb_width_pct,rsi_14,momentum_10,bb_upper,bb_lower,bb_expanding,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")?;
+        let mut sig_stmt = tx.prepare("INSERT INTO signal_events (ts,event_type,symbol,direction,deviation_pct,market_price,chainlink_price,chainlink_age_secs,prev_price,new_price,price_delta,delta_pct,round_duration_secs,signals_json,bb_width_pct,rsi_14,momentum_10,mro_5,mro_10,mro_15,bb_upper,bb_lower,bb_expanding,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")?;
 
         for evt in events.iter() {
             match evt {
@@ -368,28 +404,39 @@ fn flush_oracle_events(conn: &mut Connection, events: &mut Vec<WsEvent>, write_t
                         tick_stmt.execute(params![
                             ts.to_rfc3339(), data.symbol, data.market_price, data.chainlink_price, data.chainlink_age_secs.map(|v| v as i64), data.deviation_pct, data.round_imminent,
                             data.exchange_prices.get("binance").copied(), data.exchange_prices.get("coinbase").copied(), data.exchange_prices.get("kraken").copied(),
+                            data.exchange_latency_ms.as_ref().and_then(|m| m.get("binance").copied()), data.exchange_latency_ms.as_ref().and_then(|m| m.get("coinbase").copied()), data.exchange_latency_ms.as_ref().and_then(|m| m.get("kraken").copied()),
                             data.indicators.ema_12, data.indicators.ema_26, data.indicators.ema_50, data.indicators.rsi_14,
-                            data.indicators.momentum_10, data.indicators.momentum_20, data.indicators.volatility,
+                            data.indicators.momentum_10, data.indicators.momentum_20, data.indicators.mro_5, data.indicators.mro_10, data.indicators.mro_15, data.indicators.volatility,
                             data.indicators.bb_upper, data.indicators.bb_middle, data.indicators.bb_lower,
                             data.indicators.macd, data.indicators.macd_signal, data.indicators.macd_histogram,
+                            data.p_lmsr, data.delta_lmsr, data.delta_lmsr_z, data.lmsr_version.clone(), data.alpha_live, data.b_live,
                         ])?;
                     }
                 }
                 WsEvent::PreTriggerAlert { ts, data } => {
-                    sig_stmt.execute(params![ts.to_rfc3339(),"pre_trigger_alert","BTC/USD",dir_to_str(&data.direction),Some(data.deviation_pct),Some(data.market_price),Some(data.chainlink_price),Some(data.chainlink_age_secs as i64),Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<i64>::None,Some(serde_json::to_string(&data.signals).unwrap_or_else(|_|"[]".to_string())),data.bb_width_pct,data.rsi_14,data.momentum_10,Option::<f64>::None,Option::<f64>::None,Option::<bool>::None,serde_json::to_string(evt).ok()])?;
+                    sig_stmt.execute(params![ts.to_rfc3339(),"pre_trigger_alert","BTC/USD",dir_to_str(&data.direction),Some(data.deviation_pct),Some(data.market_price),Some(data.chainlink_price),Some(data.chainlink_age_secs as i64),Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<i64>::None,Some(serde_json::to_string(&data.signals).unwrap_or_else(|_|"[]".to_string())),data.bb_width_pct,data.rsi_14,data.momentum_10,data.mro_5,data.mro_10,data.mro_15,Option::<f64>::None,Option::<f64>::None,Option::<bool>::None,serde_json::to_string(evt).ok()])?;
                 }
                 WsEvent::RoundTriggered { ts, data } => {
-                    sig_stmt.execute(params![ts.to_rfc3339(),"round_triggered","BTC/USD",dir_to_str(&data.direction),Some(data.deviation_pct),Some(data.market_price),Some(data.chainlink_price),Some(data.chainlink_age_secs as i64),Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<i64>::None,Option::<String>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<bool>::None,serde_json::to_string(evt).ok()])?;
+                    sig_stmt.execute(params![ts.to_rfc3339(),"round_triggered","BTC/USD",dir_to_str(&data.direction),Some(data.deviation_pct),Some(data.market_price),Some(data.chainlink_price),Some(data.chainlink_age_secs as i64),Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<i64>::None,Option::<String>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<bool>::None,serde_json::to_string(evt).ok()])?;
                 }
                 WsEvent::RoundSettled { ts, data } => {
                     if data.round_duration_secs.is_none() { continue; }
-                    sig_stmt.execute(params![ts.to_rfc3339(),"round_settled","BTC/USD",Option::<String>::None,Some(data.delta_pct),Some(data.new_price),Option::<f64>::None,Option::<i64>::None,Some(data.prev_price),Some(data.new_price),Some(data.price_delta),Some(data.delta_pct),data.round_duration_secs.map(|v|v as i64),Option::<String>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<bool>::None,serde_json::to_string(evt).ok()])?;
+                    sig_stmt.execute(params![ts.to_rfc3339(),"round_settled","BTC/USD",Option::<String>::None,Some(data.delta_pct),Some(data.new_price),Option::<f64>::None,Option::<i64>::None,Some(data.prev_price),Some(data.new_price),Some(data.price_delta),Some(data.delta_pct),data.round_duration_secs.map(|v|v as i64),Option::<String>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<bool>::None,serde_json::to_string(evt).ok()])?;
                 }
                 WsEvent::DeviationApproach { ts, data } => {
-                    sig_stmt.execute(params![ts.to_rfc3339(),"deviation_approach","BTC/USD",dir_to_str(&data.direction),Some(data.deviation_pct),Some(data.market_price),Some(data.chainlink_price),Some(data.chainlink_age_secs as i64),Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<i64>::None,Option::<String>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<bool>::None,serde_json::to_string(evt).ok()])?;
+                    sig_stmt.execute(params![ts.to_rfc3339(),"deviation_approach","BTC/USD",dir_to_str(&data.direction),Some(data.deviation_pct),Some(data.market_price),Some(data.chainlink_price),Some(data.chainlink_age_secs as i64),Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<i64>::None,Option::<String>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<bool>::None,serde_json::to_string(evt).ok()])?;
                 }
                 WsEvent::BbBreakout { ts, data } => {
-                    sig_stmt.execute(params![ts.to_rfc3339(),"bb_breakout","BTC/USD",dir_to_str(&data.direction),data.deviation_pct,Some(data.market_price),Option::<f64>::None,Option::<i64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<i64>::None,Option::<String>::None,Some(data.bb_width_pct),Option::<f64>::None,Option::<f64>::None,Some(data.bb_upper),Some(data.bb_lower),Some(data.bb_expanding),serde_json::to_string(evt).ok()])?;
+                    sig_stmt.execute(params![
+                        ts.to_rfc3339(),"bb_breakout","BTC/USD",dir_to_str(&data.direction),
+                        data.deviation_pct,Some(data.market_price),Option::<f64>::None,Option::<i64>::None,
+                        Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,Option::<i64>::None,
+                        Option::<String>::None,
+                        Some(data.bb_width_pct),Option::<f64>::None,Option::<f64>::None,
+                        Option::<f64>::None,Option::<f64>::None,Option::<f64>::None,
+                        Some(data.bb_upper),Some(data.bb_lower),Some(data.bb_expanding),
+                        serde_json::to_string(evt).ok()
+                    ])?;
                 }
                 WsEvent::ExchangeStatus { .. } => {}
             }
@@ -404,10 +451,10 @@ fn flush_market_upserts(conn: &mut Connection, batches: &mut Vec<Vec<MarketUpser
     if batches.is_empty() { return Ok(()); }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare("INSERT INTO pm_markets (condition_id,question,asset,timeframe,direction,close_time,resolved_at,outcome,winning_price,token_yes_id,token_no_id,last_updated) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, now()) ON CONFLICT(condition_id) DO UPDATE SET question=excluded.question,asset=excluded.asset,timeframe=excluded.timeframe,close_time=excluded.close_time,resolved_at=COALESCE(excluded.resolved_at,pm_markets.resolved_at),outcome=COALESCE(excluded.outcome,pm_markets.outcome),winning_price=COALESCE(excluded.winning_price,pm_markets.winning_price),token_yes_id=excluded.token_yes_id,token_no_id=excluded.token_no_id,last_updated=now()")?;
+        let mut stmt = tx.prepare("INSERT INTO pm_markets (condition_id,question,asset,timeframe,direction,close_time,resolved_at,outcome,winning_price,token_yes_id,token_no_id,pivot_price,last_updated) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, now()) ON CONFLICT(condition_id) DO UPDATE SET question=excluded.question,asset=excluded.asset,timeframe=excluded.timeframe,close_time=excluded.close_time,resolved_at=COALESCE(excluded.resolved_at,pm_markets.resolved_at),outcome=COALESCE(excluded.outcome,pm_markets.outcome),winning_price=COALESCE(excluded.winning_price,pm_markets.winning_price),token_yes_id=excluded.token_yes_id,token_no_id=excluded.token_no_id,pivot_price=COALESCE(excluded.pivot_price,pm_markets.pivot_price),last_updated=now()")?;
         for batch in batches.iter() {
             for m in batch {
-                stmt.execute(params![m.condition_id,m.question,m.asset,m.timeframe,m.close_time,m.resolved_at,m.outcome,m.winning_price,m.token_yes_id,m.token_no_id])?;
+                stmt.execute(params![m.condition_id,m.question,m.asset,m.timeframe,m.close_time,m.resolved_at,m.outcome,m.winning_price,m.token_yes_id,m.token_no_id,m.pivot_price])?;
             }
         }
     }
@@ -417,6 +464,34 @@ fn flush_market_upserts(conn: &mut Connection, batches: &mut Vec<Vec<MarketUpser
 }
 
 pub async fn run_writer_loop(mut rx: mpsc::Receiver<DbOp>, flush_every_ms: u64, ui_state: Arc<RwLock<ClobUiState>>) {
+    let writes_enabled = std::env::var("DB_WRITES_ENABLED")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true);
+
+    if !writes_enabled {
+        warn!("db writer disabled via DB_WRITES_ENABLED=false; consuming queue without persistence");
+        let mut received_rows: u64 = 0;
+        let mut stats_tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            tokio::select! {
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some(_op) => { received_rows += 1; }
+                        None => break,
+                    }
+                }
+                _ = stats_tick.tick() => {
+                    {
+                        let mut s = ui_state.write().await;
+                        s.set_writer_stats(received_rows, 0, 0, 0);
+                    }
+                    info!(writer_received_rows=received_rows, "db writer disabled stats");
+                }
+            }
+        }
+        return;
+    }
+
     let mut conn = match open_db() {
         Ok(c) => c,
         Err(e) => {

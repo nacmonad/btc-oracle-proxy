@@ -133,6 +133,9 @@ fn event_to_signal(evt: &WsEvent) -> Option<Value> {
                 "bb_width_pct": data.bb_width_pct,
                 "rsi_14": data.rsi_14,
                 "momentum_10": data.momentum_10,
+                "mro_5": data.mro_5,
+                "mro_10": data.mro_10,
+                "mro_15": data.mro_15,
             }
         })),
         _ => None,
@@ -147,6 +150,7 @@ fn build_conditions(clob: &ClobUiState, sub: &ClientSub) -> Vec<Value> {
         close_time: String,
         token_yes_id: String,
         token_no_id: String,
+        pivot_price: Option<f64>,
     }
 
     let mut by_condition: HashMap<String, CondAcc> = HashMap::new();
@@ -157,6 +161,7 @@ fn build_conditions(clob: &ClobUiState, sub: &ClientSub) -> Vec<Value> {
         let e = by_condition.entry(m.condition_id.clone()).or_default();
         e.timeframe = m.timeframe.clone();
         e.close_time = m.close_time.clone();
+        if e.pivot_price.is_none() { e.pivot_price = m.pivot; }
         if m.side.eq_ignore_ascii_case("UP") {
             e.token_yes_id = m.token_id.clone();
         } else if m.side.eq_ignore_ascii_case("DOWN") {
@@ -184,6 +189,7 @@ fn build_conditions(clob: &ClobUiState, sub: &ClientSub) -> Vec<Value> {
             "close_time": acc.close_time,
             "token_yes_id": acc.token_yes_id,
             "token_no_id": acc.token_no_id,
+            "pivot_price": acc.pivot_price,
             "clob_l1": {
                 "yes": {"best_bid": yes.best_bid, "best_ask": yes.best_ask, "spread": yes.spread},
                 "no":  {"best_bid": no.best_bid,  "best_ask": no.best_ask,  "spread": no.spread}
@@ -197,8 +203,14 @@ fn build_conditions(clob: &ClobUiState, sub: &ClientSub) -> Vec<Value> {
     out
 }
 
+fn pivot_for_condition(clob: &ClobUiState, cid: &str) -> Option<f64> {
+    clob.markets.values().find(|m| m.condition_id == cid).and_then(|m| m.pivot)
+}
+
 fn build_market_frame(seq: u64, tick: &PriceUpdate, signals: &[Value], sub: &ClientSub, clob: &ClobUiState) -> Value {
     let conditions = build_conditions(clob, sub);
+    let pivot_price = tick.condition_id.as_ref().and_then(|cid| pivot_for_condition(clob, cid));
+    let pivot_price_5m = tick.condition_id_5m.as_ref().and_then(|cid| pivot_for_condition(clob, cid));
     json!({
         "type": "market_frame",
         "schema_version": 1,
@@ -212,6 +224,28 @@ fn build_market_frame(seq: u64, tick: &PriceUpdate, signals: &[Value], sub: &Cli
             "chainlink_price": tick.chainlink_price,
             "chainlink_age_secs": tick.chainlink_age_secs,
             "deviation_pct": tick.deviation_pct,
+            "condition_id": tick.condition_id,
+            "up_bid": tick.up_bid,
+            "up_ask": tick.up_ask,
+            "down_bid": tick.down_bid,
+            "down_ask": tick.down_ask,
+            "condition_id_5m": tick.condition_id_5m,
+            "pivot_price": pivot_price,
+            "pivot_price_5m": pivot_price_5m,
+            "up_bid_5m": tick.up_bid_5m,
+            "up_ask_5m": tick.up_ask_5m,
+            "down_bid_5m": tick.down_bid_5m,
+            "down_ask_5m": tick.down_ask_5m,
+            "p_expected": tick.p_expected,
+            "p_lmsr": tick.p_lmsr,
+            "delta_lmsr": tick.delta_lmsr,
+            "delta_lmsr_z": tick.delta_lmsr_z,
+            "p_lmsr_5m": tick.p_lmsr_5m,
+            "delta_lmsr_5m": tick.delta_lmsr_5m,
+            "delta_lmsr_z_5m": tick.delta_lmsr_z_5m,
+            "lmsr_version": tick.lmsr_version,
+            "alpha_live": tick.alpha_live,
+            "b_live": tick.b_live,
         },
         "signals": signals,
         "conditions": conditions,
